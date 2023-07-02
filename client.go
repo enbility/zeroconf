@@ -6,6 +6,7 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"reflect"
 	"runtime"
 	"strings"
 	"time"
@@ -282,8 +283,16 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 					continue
 				}
 
-				if _, ok := sentEntries[k]; ok {
-					continue
+				if se, ok := sentEntries[k]; ok {
+					// only resend if a value differes from the previously sent item
+					if e.HostName == se.HostName &&
+						e.Port == se.Port &&
+						reflect.DeepEqual(e.Text, se.Text) &&
+						e.Expiry.After(now) == se.Expiry.After(now) &&
+						reflect.DeepEqual(e.AddrIPv4, se.AddrIPv4) &&
+						reflect.DeepEqual(e.AddrIPv6, se.AddrIPv6) {
+						continue
+					}
 				}
 
 				// If this is an DNS-SD query do not throw PTR away.
