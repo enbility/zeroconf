@@ -21,15 +21,22 @@ func main() {
 	entries := make(chan *zeroconf.ServiceEntry)
 	go func(results <-chan *zeroconf.ServiceEntry) {
 		for entry := range results {
-			log.Println(entry)
+			log.Println("New/Updated", entry)
 		}
 		log.Println("No more entries.")
 	}(entries)
+	removed := make(chan *zeroconf.ServiceEntry)
+	go func(results <-chan *zeroconf.ServiceEntry) {
+		for entry := range results {
+			log.Println("Expired/Removed", entry)
+		}
+		log.Println("No more entries.")
+	}(removed)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*time.Duration(*waitTime))
 	defer cancel()
 	// Discover all services on the network (e.g. _workstation._tcp)
-	err := zeroconf.Browse(ctx, *service, *domain, entries)
+	err := zeroconf.Browse(ctx, *service, *domain, entries, removed)
 	if err != nil {
 		log.Fatalln("Failed to browse:", err.Error())
 	}

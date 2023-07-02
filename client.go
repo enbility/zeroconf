@@ -67,7 +67,7 @@ func SelectIfaces(ifaces []net.Interface) ClientOption {
 // Browse for all services of a given type in a given domain.
 // Received entries are sent on the entries channel.
 // It blocks until the context is canceled (or an error occurs).
-func Browse(ctx context.Context, service, domain string, entries chan<- *ServiceEntry, opts ...ClientOption) error {
+func Browse(ctx context.Context, service, domain string, entries, removed chan<- *ServiceEntry, opts ...ClientOption) error {
 	cl, err := newClient(applyOpts(opts...))
 	if err != nil {
 		return err
@@ -77,6 +77,7 @@ func Browse(ctx context.Context, service, domain string, entries chan<- *Service
 		params.Domain = domain
 	}
 	params.Entries = entries
+	params.Removed = removed
 	params.isBrowsing = true
 	return cl.run(ctx, params)
 }
@@ -129,7 +130,7 @@ func (c *client) run(ctx context.Context, params *lookupParams) error {
 
 // defaultParams returns a default set of QueryParams.
 func defaultParams(service string) *lookupParams {
-	return newLookupParams("", service, "local", false, make(chan *ServiceEntry))
+	return newLookupParams("", service, "local", false, make(chan *ServiceEntry), make(chan *ServiceEntry))
 }
 
 // Client structure constructor
@@ -194,6 +195,7 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 		case t := <-ticker.C:
 			for k, e := range sentEntries {
 				if t.After(e.Expiry) {
+					params.Removed <- e
 					delete(sentEntries, k)
 				}
 			}
@@ -274,7 +276,10 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 			for k, e := range entries {
 				if !e.Expiry.After(now) {
 					delete(entries, k)
-					delete(sentEntries, k)
+					if se, ok := sentEntries[k]; ok {
+						params.Removed <- se
+						delete(sentEntries, k)
+					}
 					continue
 				}
 

@@ -52,7 +52,8 @@ func TestBasic(t *testing.T) {
 	time.Sleep(time.Second)
 
 	entries := make(chan *ServiceEntry, 100)
-	if err := Browse(ctx, mdnsService, mdnsDomain, entries); err != nil {
+	expired := make(chan *ServiceEntry, 100)
+	if err := Browse(ctx, mdnsService, mdnsDomain, entries, expired); err != nil {
 		t.Fatalf("Expected browse success, but got %v", err)
 	}
 	<-ctx.Done()
@@ -84,9 +85,16 @@ func TestNoRegister(t *testing.T) {
 			t.Errorf("Expected empty service entries but got %v", *s)
 		}
 	}(entries)
+	expired := make(chan *ServiceEntry)
+	go func(results <-chan *ServiceEntry) {
+		s := <-results
+		if s != nil {
+			t.Errorf("Expected empty service entries but got %v", *s)
+		}
+	}(expired)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	if err := Browse(ctx, mdnsService, mdnsDomain, entries); err != nil {
+	if err := Browse(ctx, mdnsService, mdnsDomain, entries, expired); err != nil {
 		t.Fatalf("Expected browse success, but got %v", err)
 	}
 	<-ctx.Done()
@@ -103,7 +111,8 @@ func TestSubtype(t *testing.T) {
 		time.Sleep(time.Second)
 
 		entries := make(chan *ServiceEntry, 100)
-		if err := Browse(ctx, mdnsSubtype, mdnsDomain, entries); err != nil {
+		expired := make(chan *ServiceEntry, 100)
+		if err := Browse(ctx, mdnsSubtype, mdnsDomain, entries, expired); err != nil {
 			t.Fatalf("Expected browse success, but got %v", err)
 		}
 		<-ctx.Done()
@@ -135,7 +144,8 @@ func TestSubtype(t *testing.T) {
 		time.Sleep(time.Second)
 
 		entries := make(chan *ServiceEntry, 100)
-		if err := Browse(ctx, mdnsService, mdnsDomain, entries); err != nil {
+		expired := make(chan *ServiceEntry, 100)
+		if err := Browse(ctx, mdnsService, mdnsDomain, entries, expired); err != nil {
 			t.Fatalf("Expected browse success, but got %v", err)
 		}
 		<-ctx.Done()
@@ -176,7 +186,8 @@ func TestSubtype(t *testing.T) {
 		startMDNS(t, mdnsPort, mdnsName, mdnsSubtype, mdnsDomain)
 
 		entries := make(chan *ServiceEntry, 100)
-		if err := Browse(ctx, mdnsService, mdnsDomain, entries); err != nil {
+		expired := make(chan *ServiceEntry, 100)
+		if err := Browse(ctx, mdnsService, mdnsDomain, entries, expired); err != nil {
 			t.Fatalf("Expected browse success, but got %v", err)
 		}
 

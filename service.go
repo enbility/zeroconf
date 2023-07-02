@@ -70,6 +70,7 @@ func newServiceRecord(instance, service string, domain string) *ServiceRecord {
 type lookupParams struct {
 	ServiceRecord
 	Entries chan<- *ServiceEntry // Entries Channel
+	Removed chan<- *ServiceEntry // Expired and Removed Channel
 
 	isBrowsing  bool
 	stopProbing chan struct{}
@@ -77,10 +78,11 @@ type lookupParams struct {
 }
 
 // newLookupParams constructs a lookupParams.
-func newLookupParams(instance, service, domain string, isBrowsing bool, entries chan<- *ServiceEntry) *lookupParams {
+func newLookupParams(instance, service, domain string, isBrowsing bool, entries, removed chan<- *ServiceEntry) *lookupParams {
 	p := &lookupParams{
 		ServiceRecord: *newServiceRecord(instance, service, domain),
 		Entries:       entries,
+		Removed:       removed,
 		isBrowsing:    isBrowsing,
 	}
 	if !isBrowsing {
@@ -93,6 +95,7 @@ func newLookupParams(instance, service, domain string, isBrowsing bool, entries 
 // by an expired context.
 func (l *lookupParams) done() {
 	close(l.Entries)
+	close(l.Removed)
 }
 
 func (l *lookupParams) disableProbing() {
