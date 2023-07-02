@@ -276,6 +276,12 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 					delete(sentEntries, k)
 					continue
 				}
+
+				// ignore entries not having an IPv4 address
+				if len(e.AddrIPv4) == 0 {
+					continue
+				}
+
 				if _, ok := sentEntries[k]; ok {
 					continue
 				}
