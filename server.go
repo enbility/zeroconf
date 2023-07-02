@@ -549,7 +549,7 @@ func (s *Server) serviceTypeName(resp *dns.Msg, ttl uint32) {
 }
 
 // Perform probing & announcement
-//TODO: implement a proper probing & conflict resolution
+// TODO: implement a proper probing & conflict resolution
 func (s *Server) probe() {
 	defer s.refCount.Done()
 
@@ -647,7 +647,7 @@ func (s *Server) announceText() {
 	}
 
 	resp.Answer = []dns.RR{txt}
-	s.multicastResponse(resp, 0)
+	_ = s.multicastResponse(resp, 0)
 }
 
 func (s *Server) unregister() error {
@@ -779,7 +779,7 @@ func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int) error {
 					log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
 				}
 			}
-			s.ipv4conn.WriteTo(buf, &wcm, ipv4Addr)
+			_, _ = s.ipv4conn.WriteTo(buf, &wcm, ipv4Addr)
 		} else {
 			for _, intf := range s.ifaces {
 				switch runtime.GOOS {
@@ -790,7 +790,7 @@ func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int) error {
 						log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
 					}
 				}
-				s.ipv4conn.WriteTo(buf, &wcm, ipv4Addr)
+				_, _ = s.ipv4conn.WriteTo(buf, &wcm, ipv4Addr)
 			}
 		}
 	}
@@ -810,7 +810,7 @@ func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int) error {
 					log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
 				}
 			}
-			s.ipv6conn.WriteTo(buf, &wcm, ipv6Addr)
+			_, _ = s.ipv6conn.WriteTo(buf, &wcm, ipv6Addr)
 		} else {
 			for _, intf := range s.ifaces {
 				switch runtime.GOOS {
@@ -821,7 +821,7 @@ func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int) error {
 						log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
 					}
 				}
-				s.ipv6conn.WriteTo(buf, &wcm, ipv6Addr)
+				_, _ = s.ipv6conn.WriteTo(buf, &wcm, ipv6Addr)
 			}
 		}
 	}
