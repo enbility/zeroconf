@@ -165,7 +165,7 @@ func newClient(opts clientOpts) (*client, error) {
 	}, nil
 }
 
-var cleanupFreq = 10 * time.Second
+var cleanupFreq = 5 * time.Second
 
 // Start listeners and waits for the shutdown signal from exit channel
 func (c *client) mainloop(ctx context.Context, params *lookupParams) {
