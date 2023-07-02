@@ -291,6 +291,7 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 						e.Expiry.After(now) == se.Expiry.After(now) &&
 						reflect.DeepEqual(e.AddrIPv4, se.AddrIPv4) &&
 						reflect.DeepEqual(e.AddrIPv6, se.AddrIPv6) {
+						sentEntries[k].Expiry = e.Expiry
 						continue
 					}
 				}
