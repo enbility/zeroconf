@@ -278,11 +278,6 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 					continue
 				}
 
-				// ignore entries not having an IPv4 address
-				if len(e.AddrIPv4) == 0 {
-					continue
-				}
-
 				if se, ok := sentEntries[k]; ok {
 					// only resend if a value differes from the previously sent item
 					if e.HostName == se.HostName &&
@@ -301,6 +296,11 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 					// Require at least one resolved IP address for ServiceEntry
 					// TODO: wait some more time as chances are high both will arrive.
 					if len(e.AddrIPv4) == 0 && len(e.AddrIPv6) == 0 {
+						continue
+					}
+
+					// ignore entries not having an IPv4 address
+					if len(e.AddrIPv4) == 0 {
 						continue
 					}
 				}
