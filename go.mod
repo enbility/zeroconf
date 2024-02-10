@@ -1,4 +1,4 @@
-module github.com/DerAndereAndi/zeroconf/v2
+module github.com/enbility/zeroconf/v2
 
 go 1.20
 

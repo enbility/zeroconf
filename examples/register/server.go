@@ -9,7 +9,7 @@ import (
 
 	"time"
 
-	"github.com/DerAndereAndi/zeroconf/v2"
+	"github.com/enbility/zeroconf/v2"
 )
 
 var (
