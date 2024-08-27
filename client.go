@@ -304,11 +304,6 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 					if len(e.AddrIPv4) == 0 && len(e.AddrIPv6) == 0 {
 						continue
 					}
-
-					// ignore entries not having an IPv4 address
-					if len(e.AddrIPv4) == 0 {
-						continue
-					}
 				}
 				// Submit entry to subscriber and cache it.
 				// This is also a point to possibly stop probing actively for a
