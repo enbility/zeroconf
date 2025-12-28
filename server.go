@@ -274,7 +274,13 @@ func (s *Server) recv4(c *ipv4.PacketConn) {
 			var ifIndex int
 			n, cm, from, err := c.ReadFrom(buf)
 			if err != nil {
-				continue
+				// Backoff to prevent CPU spin on persistent errors
+				select {
+				case <-s.shouldShutdown:
+					return
+				case <-time.After(50 * time.Millisecond):
+					continue
+				}
 			}
 			if cm != nil {
 				ifIndex = cm.IfIndex
@@ -299,7 +305,13 @@ func (s *Server) recv6(c *ipv6.PacketConn) {
 			var ifIndex int
 			n, cm, from, err := c.ReadFrom(buf)
 			if err != nil {
-				continue
+				// Backoff to prevent CPU spin on persistent errors
+				select {
+				case <-s.shouldShutdown:
+					return
+				case <-time.After(50 * time.Millisecond):
+					continue
+				}
 			}
 			if cm != nil {
 				ifIndex = cm.IfIndex
