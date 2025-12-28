@@ -3,6 +3,7 @@ package zeroconf
 import (
 	"context"
 	"log"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -201,4 +202,73 @@ func TestSubtype(t *testing.T) {
 			t.Fatalf("expected the two entries to be identical")
 		}
 	})
+}
+
+// TestCPUSpinOnConnectionClose demonstrates the CPU spinning bug that occurs
+// when connections are closed externally (simulating network interface changes).
+// This reproduces the issue seen on Windows after hours of running.
+func TestCPUSpinOnConnectionClose(t *testing.T) {
+	server, err := Register(mdnsName, mdnsService, mdnsDomain, mdnsPort,
+		[]string{"txtv=0", "lo=1", "la=2"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Let the server start and stabilize
+	time.Sleep(100 * time.Millisecond)
+
+	// Measure baseline goroutine count
+	baselineGoroutines := runtime.NumGoroutine()
+	t.Logf("Baseline goroutines: %d", baselineGoroutines)
+
+	// Get baseline CPU stats
+	var baselineStats runtime.MemStats
+	runtime.ReadMemStats(&baselineStats)
+	baselineMallocs := baselineStats.Mallocs
+
+	// Close connections WITHOUT triggering shutdown
+	// This simulates what happens when network interfaces change on Windows
+	if server.ipv4conn != nil {
+		server.ipv4conn.Close()
+	}
+	if server.ipv6conn != nil {
+		server.ipv6conn.Close()
+	}
+
+	t.Log("Connections closed - recv loops should now be spinning on errors")
+
+	// Wait and measure - if spinning, we'll see high allocation rate
+	// because the tight loop keeps running
+	time.Sleep(500 * time.Millisecond)
+
+	var afterStats runtime.MemStats
+	runtime.ReadMemStats(&afterStats)
+	allocsDuring := afterStats.Mallocs - baselineMallocs
+
+	t.Logf("Allocations during 500ms after connection close: %d", allocsDuring)
+	t.Logf("Current goroutines: %d", runtime.NumGoroutine())
+
+	// A spinning loop will have many more allocations than a properly blocked one
+	// This threshold is somewhat arbitrary but a blocked recv should have near-zero
+	// while a spinning one will have thousands
+	if allocsDuring > 10000 {
+		t.Errorf("DETECTED CPU SPIN: %d allocations in 500ms indicates tight loop", allocsDuring)
+		t.Log("This confirms the bug: recv loops spin when ReadFrom returns errors")
+	} else {
+		t.Logf("Allocation count (%d) suggests recv loops may be handling errors correctly", allocsDuring)
+	}
+
+	// Clean up - this should work even with closed connections
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		server.Shutdown()
+	}()
+
+	select {
+	case <-done:
+		t.Log("Shutdown completed successfully")
+	case <-time.After(2 * time.Second):
+		t.Error("Shutdown timed out - recv loops may be stuck")
+	}
 }
