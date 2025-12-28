@@ -1,9 +1,10 @@
 package zeroconf
 
 import (
-	"log"
+	"fmt"
 	"net"
 	"runtime"
+	"syscall"
 
 	"github.com/enbility/zeroconf/v3/api"
 	"golang.org/x/net/ipv6"
@@ -37,20 +38,32 @@ func (c *ipv6PacketConn) WriteTo(b []byte, ifIndex int, dst net.Addr) (n int, er
 	// On Windows, the ControlMessage for WriteTo is not implemented.
 	// Use SetMulticastInterface as fallback.
 	var cm *ipv6.ControlMessage
+
 	if ifIndex != 0 {
 		switch runtime.GOOS {
 		case "darwin", "ios", "linux":
 			cm = &ipv6.ControlMessage{IfIndex: ifIndex}
+
 		default:
-			// Windows and other platforms: use SetMulticastInterface
-			iface, _ := net.InterfaceByIndex(ifIndex)
-			if iface != nil {
-				if err := c.conn.SetMulticastInterface(iface); err != nil {
-					log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
-				}
+			// Windows and other platforms: validate and set interface.
+			// CRITICAL: Return errors instead of logging them. The caller
+			// (via InterfaceManager.MarkFailed) handles removal and backoff.
+			iface, err := net.InterfaceByIndex(ifIndex)
+			if err != nil {
+				// Interface gone - wrap with ENXIO so isInterfaceGone() detects it
+				return 0, fmt.Errorf("interface index %d: %w", ifIndex, syscall.ENXIO)
+			}
+			// Verify interface is actually up
+			if iface.Flags&net.FlagUp == 0 {
+				return 0, fmt.Errorf("interface %s is down: %w", iface.Name, syscall.ENETDOWN)
+			}
+			if err := c.conn.SetMulticastInterface(iface); err != nil {
+				// Return the actual error - may contain WSAENETDOWN or similar
+				return 0, fmt.Errorf("set multicast interface %s: %w", iface.Name, err)
 			}
 		}
 	}
+
 	return c.conn.WriteTo(b, cm, dst)
 }
 

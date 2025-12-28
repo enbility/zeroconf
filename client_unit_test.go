@@ -5,30 +5,176 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/enbility/zeroconf/v3/api"
 	"github.com/enbility/zeroconf/v3/mocks"
 	"github.com/miekg/dns"
 	"github.com/stretchr/testify/mock"
 )
+
+// testClient creates a Client with mock connections and InterfaceManagers.
+// This is a helper for unit tests that need to create a Client directly.
+func testClient(ipv4conn, ipv6conn api.PacketConn, ifaces []net.Interface) *Client {
+	return &Client{
+		ipv4conn: ipv4conn,
+		ipv6conn: ipv6conn,
+		ipv4Mgr:  NewInterfaceManager(ifaces, nil),
+		ipv6Mgr:  NewInterfaceManager(ifaces, nil),
+		provider: NewInterfaceProvider(),
+	}
+}
+
+// TestClient_InterfaceDisconnect_StopsSendingToFailedInterface is the key integration test
+// that verifies the fix for the original issue: when an interface disconnects, we should
+// stop sending to it rather than generating infinite warning logs.
+//
+// Original issue: Interface disconnects -> WriteTo fails -> code keeps trying -> infinite warnings
+// Expected behavior: Interface disconnects -> WriteTo fails -> interface removed -> no more attempts
+func TestClient_InterfaceDisconnect_StopsSendingToFailedInterface(t *testing.T) {
+	mockIPv4 := mocks.NewMockPacketConn(t)
+
+	// Two interfaces: eth0 (will fail) and wlan0 (stays healthy)
+	ifaces := []net.Interface{
+		{Index: 1, Name: "eth0"},
+		{Index: 2, Name: "wlan0"},
+	}
+
+	// Track calls per interface
+	var mu sync.Mutex
+	callsToEth0 := 0
+	callsToWlan0 := 0
+
+	// eth0 (index 1) will return ENETDOWN error (simulating disconnect)
+	// wlan0 (index 2) will succeed
+	mockIPv4.EXPECT().WriteTo(mock.Anything, mock.AnythingOfType("int"), mock.Anything).RunAndReturn(
+		func(b []byte, ifIndex int, dst net.Addr) (int, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if ifIndex == 1 {
+				callsToEth0++
+				// Simulate interface gone - this is the error that was causing infinite warnings
+				return 0, syscall.ENETDOWN
+			}
+			callsToWlan0++
+			return len(b), nil
+		}).Maybe()
+
+	c := testClient(mockIPv4, nil, ifaces)
+
+	msg := new(dns.Msg)
+	msg.SetQuestion("_test._tcp.local.", dns.TypePTR)
+
+	// First query: both interfaces should be attempted
+	// eth0 fails with ENETDOWN, wlan0 succeeds
+	_ = c.sendQuery(msg)
+
+	mu.Lock()
+	firstEth0Calls := callsToEth0
+	firstWlan0Calls := callsToWlan0
+	mu.Unlock()
+
+	if firstEth0Calls != 1 {
+		t.Errorf("First query: expected 1 call to eth0, got %d", firstEth0Calls)
+	}
+	if firstWlan0Calls != 1 {
+		t.Errorf("First query: expected 1 call to wlan0, got %d", firstWlan0Calls)
+	}
+
+	// Second query: eth0 should NOT be attempted (it was marked failed)
+	// Only wlan0 should receive the query
+	_ = c.sendQuery(msg)
+
+	mu.Lock()
+	secondEth0Calls := callsToEth0
+	secondWlan0Calls := callsToWlan0
+	mu.Unlock()
+
+	// THE KEY ASSERTION: eth0 should NOT have been called again
+	// This is the fix for the infinite warning issue
+	if secondEth0Calls != 1 {
+		t.Errorf("Second query: expected eth0 to NOT be called again (still 1), got %d calls total", secondEth0Calls)
+	}
+	if secondWlan0Calls != 2 {
+		t.Errorf("Second query: expected wlan0 to be called (now 2), got %d calls total", secondWlan0Calls)
+	}
+
+	// Third query: same behavior - eth0 still excluded
+	_ = c.sendQuery(msg)
+
+	mu.Lock()
+	thirdEth0Calls := callsToEth0
+	thirdWlan0Calls := callsToWlan0
+	mu.Unlock()
+
+	if thirdEth0Calls != 1 {
+		t.Errorf("Third query: eth0 should still be excluded (1 call total), got %d", thirdEth0Calls)
+	}
+	if thirdWlan0Calls != 3 {
+		t.Errorf("Third query: expected wlan0 calls to be 3, got %d", thirdWlan0Calls)
+	}
+
+	t.Logf("SUCCESS: After eth0 disconnect, subsequent queries only went to wlan0")
+	t.Logf("eth0 calls: %d (only the initial failed attempt)", thirdEth0Calls)
+	t.Logf("wlan0 calls: %d (all 3 queries)", thirdWlan0Calls)
+}
+
+// TestClient_AllInterfacesDisconnect_NoInfiniteLoop verifies that if ALL interfaces
+// disconnect, we don't enter an infinite loop - we just have no interfaces to send to.
+func TestClient_AllInterfacesDisconnect_NoInfiniteLoop(t *testing.T) {
+	mockIPv4 := mocks.NewMockPacketConn(t)
+
+	ifaces := []net.Interface{{Index: 1, Name: "eth0"}}
+
+	callCount := 0
+	var mu sync.Mutex
+
+	// Interface always returns ENETDOWN
+	mockIPv4.EXPECT().WriteTo(mock.Anything, mock.AnythingOfType("int"), mock.Anything).RunAndReturn(
+		func(b []byte, ifIndex int, dst net.Addr) (int, error) {
+			mu.Lock()
+			callCount++
+			mu.Unlock()
+			return 0, syscall.ENETDOWN
+		}).Maybe()
+
+	c := testClient(mockIPv4, nil, ifaces)
+
+	msg := new(dns.Msg)
+	msg.SetQuestion("_test._tcp.local.", dns.TypePTR)
+
+	// Send multiple queries
+	for i := 0; i < 10; i++ {
+		_ = c.sendQuery(msg)
+	}
+
+	mu.Lock()
+	finalCount := callCount
+	mu.Unlock()
+
+	// Should only have 1 call - the first one that failed and removed the interface
+	// Without the fix, this would be 10 (one per query, each generating a warning)
+	if finalCount != 1 {
+		t.Errorf("Expected only 1 call to failed interface, got %d (suggests interface not removed)", finalCount)
+	}
+
+	t.Logf("SUCCESS: Only %d call to disconnected interface across 10 queries", finalCount)
+}
 
 // TestClient_SendQuery_WritesToConnections verifies sendQuery writes to both connections
 func TestClient_SendQuery_WritesToConnections(t *testing.T) {
 	mockIPv4 := mocks.NewMockPacketConn(t)
 	mockIPv6 := mocks.NewMockPacketConn(t)
 
-	iface := net.Interface{Index: 1, Name: "eth0"}
+	ifaces := []net.Interface{{Index: 1, Name: "eth0"}}
 
 	// Expect WriteTo to be called on both connections
 	mockIPv4.EXPECT().WriteTo(mock.Anything, 1, mock.Anything).Return(0, nil).Once()
 	mockIPv6.EXPECT().WriteTo(mock.Anything, 1, mock.Anything).Return(0, nil).Once()
 
-	c := &Client{
-		ipv4conn: mockIPv4,
-		ipv6conn: mockIPv6,
-		ifaces:   []net.Interface{iface},
-	}
+	c := testClient(mockIPv4, mockIPv6, ifaces)
 
 	msg := new(dns.Msg)
 	msg.SetQuestion("_test._tcp.local.", dns.TypePTR)
@@ -58,11 +204,7 @@ func TestClient_SendQuery_MultipleInterfaces(t *testing.T) {
 	mockIPv6.EXPECT().WriteTo(mock.Anything, 2, mock.Anything).Return(0, nil).Once()
 	mockIPv6.EXPECT().WriteTo(mock.Anything, 3, mock.Anything).Return(0, nil).Once()
 
-	c := &Client{
-		ipv4conn: mockIPv4,
-		ipv6conn: mockIPv6,
-		ifaces:   ifaces,
-	}
+	c := testClient(mockIPv4, mockIPv6, ifaces)
 
 	msg := new(dns.Msg)
 	msg.SetQuestion("_test._tcp.local.", dns.TypePTR)
@@ -79,11 +221,8 @@ func TestClient_SendQuery_IPv4Only(t *testing.T) {
 
 	mockIPv4.EXPECT().WriteTo(mock.Anything, 1, mock.Anything).Return(0, nil).Once()
 
-	c := &Client{
-		ipv4conn: mockIPv4,
-		ipv6conn: nil,
-		ifaces:   []net.Interface{{Index: 1, Name: "eth0"}},
-	}
+	ifaces := []net.Interface{{Index: 1, Name: "eth0"}}
+	c := testClient(mockIPv4, nil, ifaces)
 
 	msg := new(dns.Msg)
 	msg.SetQuestion("_test._tcp.local.", dns.TypePTR)
@@ -100,11 +239,8 @@ func TestClient_SendQuery_IPv6Only(t *testing.T) {
 
 	mockIPv6.EXPECT().WriteTo(mock.Anything, 1, mock.Anything).Return(0, nil).Once()
 
-	c := &Client{
-		ipv4conn: nil,
-		ipv6conn: mockIPv6,
-		ifaces:   []net.Interface{{Index: 1, Name: "eth0"}},
-	}
+	ifaces := []net.Interface{{Index: 1, Name: "eth0"}}
+	c := testClient(nil, mockIPv6, ifaces)
 
 	msg := new(dns.Msg)
 	msg.SetQuestion("_test._tcp.local.", dns.TypePTR)
@@ -123,11 +259,8 @@ func TestClient_Shutdown_ClosesConnections(t *testing.T) {
 	mockIPv4.EXPECT().Close().Return(nil).Once()
 	mockIPv6.EXPECT().Close().Return(nil).Once()
 
-	c := &Client{
-		ipv4conn: mockIPv4,
-		ipv6conn: mockIPv6,
-		ifaces:   []net.Interface{{Index: 1, Name: "eth0"}},
-	}
+	ifaces := []net.Interface{{Index: 1, Name: "eth0"}}
+	c := testClient(mockIPv4, mockIPv6, ifaces)
 
 	c.shutdown()
 }
@@ -237,11 +370,8 @@ func TestClient_Query_WithInstance(t *testing.T) {
 			return len(b), nil
 		}).Once()
 
-	c := &Client{
-		ipv4conn: mockIPv4,
-		ipv6conn: nil,
-		ifaces:   []net.Interface{{Index: 1, Name: "eth0"}},
-	}
+	ifaces := []net.Interface{{Index: 1, Name: "eth0"}}
+	c := testClient(mockIPv4, nil, ifaces)
 
 	params := newLookupParams("myservice", "_http._tcp", "local", false,
 		make(chan *ServiceEntry), make(chan *ServiceEntry))
@@ -294,11 +424,8 @@ func TestClient_Query_Browse(t *testing.T) {
 			return len(b), nil
 		}).Once()
 
-	c := &Client{
-		ipv4conn: mockIPv4,
-		ipv6conn: nil,
-		ifaces:   []net.Interface{{Index: 1, Name: "eth0"}},
-	}
+	ifaces := []net.Interface{{Index: 1, Name: "eth0"}}
+	c := testClient(mockIPv4, nil, ifaces)
 
 	// No instance = browse mode
 	params := newLookupParams("", "_http._tcp", "local", true,

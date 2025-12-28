@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -89,6 +90,87 @@ func TestServer_Recv_ProcessesPacket(t *testing.T) {
 	}
 }
 
+// testServer creates a Server with InterfaceManagers for testing.
+// This helper avoids direct struct construction with the removed ifaces field.
+func testServer(ipv4conn, ipv6conn api.PacketConn, ifaces []net.Interface) *Server {
+	return &Server{
+		ipv4conn:       ipv4conn,
+		ipv6conn:       ipv6conn,
+		ipv4Mgr:        NewInterfaceManager(ifaces, nil),
+		ipv6Mgr:        NewInterfaceManager(ifaces, nil),
+		provider:       NewInterfaceProvider(),
+		shouldShutdown: make(chan struct{}),
+		ttl:            3200,
+	}
+}
+
+// TestServer_InterfaceDisconnect_StopsSendingToFailedInterface verifies that when
+// a network interface disconnects during multicast response, the server stops
+// attempting to send to that interface. This is the server-side fix for the
+// infinite warning log issue.
+func TestServer_InterfaceDisconnect_StopsSendingToFailedInterface(t *testing.T) {
+	mockIPv4 := mocks.NewMockPacketConn(t)
+
+	// Two interfaces: eth0 (will fail) and wlan0 (stays healthy)
+	ifaces := []net.Interface{
+		{Index: 1, Name: "eth0"},
+		{Index: 2, Name: "wlan0"},
+	}
+
+	// Track calls per interface
+	var mu sync.Mutex
+	callsToEth0 := 0
+	callsToWlan0 := 0
+
+	// eth0 (index 1) returns ENETDOWN, wlan0 (index 2) succeeds
+	mockIPv4.EXPECT().WriteTo(mock.Anything, mock.AnythingOfType("int"), mock.Anything).RunAndReturn(
+		func(b []byte, ifIndex int, dst net.Addr) (int, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if ifIndex == 1 {
+				callsToEth0++
+				return 0, syscall.ENETDOWN
+			}
+			callsToWlan0++
+			return len(b), nil
+		}).Maybe()
+
+	s := testServer(mockIPv4, nil, ifaces)
+
+	msg := new(dns.Msg)
+	msg.SetQuestion("_test._tcp.local.", dns.TypePTR)
+
+	// First multicast: both interfaces attempted
+	_ = s.multicastResponse(msg, 0)
+
+	mu.Lock()
+	firstEth0 := callsToEth0
+	firstWlan0 := callsToWlan0
+	mu.Unlock()
+
+	if firstEth0 != 1 || firstWlan0 != 1 {
+		t.Errorf("First response: expected 1 call each, got eth0=%d wlan0=%d", firstEth0, firstWlan0)
+	}
+
+	// Second multicast: eth0 should be excluded
+	_ = s.multicastResponse(msg, 0)
+
+	mu.Lock()
+	secondEth0 := callsToEth0
+	secondWlan0 := callsToWlan0
+	mu.Unlock()
+
+	if secondEth0 != 1 {
+		t.Errorf("Second response: eth0 should NOT be called again, got %d total calls", secondEth0)
+	}
+	if secondWlan0 != 2 {
+		t.Errorf("Second response: wlan0 should have 2 calls, got %d", secondWlan0)
+	}
+
+	t.Logf("SUCCESS: Server stops sending to disconnected interface")
+	t.Logf("eth0 calls: %d, wlan0 calls: %d", secondEth0, secondWlan0)
+}
+
 // TestServer_MulticastResponse_WritesToConnections verifies multicast sends to both connections
 func TestServer_MulticastResponse_WritesToConnections(t *testing.T) {
 	mockIPv4 := mocks.NewMockPacketConn(t)
@@ -100,13 +182,7 @@ func TestServer_MulticastResponse_WritesToConnections(t *testing.T) {
 	mockIPv4.EXPECT().WriteTo(mock.Anything, 1, mock.Anything).Return(0, nil).Once()
 	mockIPv6.EXPECT().WriteTo(mock.Anything, 1, mock.Anything).Return(0, nil).Once()
 
-	s := &Server{
-		ipv4conn:       mockIPv4,
-		ipv6conn:       mockIPv6,
-		ifaces:         []net.Interface{iface},
-		shouldShutdown: make(chan struct{}),
-		ttl:            3200,
-	}
+	s := testServer(mockIPv4, mockIPv6, []net.Interface{iface})
 
 	msg := new(dns.Msg)
 	msg.SetQuestion("_test._tcp.local.", dns.TypePTR)
@@ -126,13 +202,7 @@ func TestServer_MulticastResponse_SpecificInterface(t *testing.T) {
 	mockIPv4.EXPECT().WriteTo(mock.Anything, 2, mock.Anything).Return(0, nil).Once()
 	mockIPv6.EXPECT().WriteTo(mock.Anything, 2, mock.Anything).Return(0, nil).Once()
 
-	s := &Server{
-		ipv4conn:       mockIPv4,
-		ipv6conn:       mockIPv6,
-		ifaces:         []net.Interface{{Index: 1, Name: "eth0"}, {Index: 2, Name: "wlan0"}},
-		shouldShutdown: make(chan struct{}),
-		ttl:            3200,
-	}
+	s := testServer(mockIPv4, mockIPv6, []net.Interface{{Index: 1, Name: "eth0"}, {Index: 2, Name: "wlan0"}})
 
 	msg := new(dns.Msg)
 	msg.SetQuestion("_test._tcp.local.", dns.TypePTR)
@@ -155,14 +225,8 @@ func TestServer_Shutdown_ClosesConnections(t *testing.T) {
 	mockIPv4.EXPECT().Close().Return(nil).Once()
 	mockIPv6.EXPECT().Close().Return(nil).Once()
 
-	s := &Server{
-		ipv4conn:       mockIPv4,
-		ipv6conn:       mockIPv6,
-		ifaces:         []net.Interface{{Index: 1, Name: "eth0"}},
-		shouldShutdown: make(chan struct{}),
-		ttl:            3200,
-		service:        newServiceEntry("test", "_test._tcp", "local"),
-	}
+	s := testServer(mockIPv4, mockIPv6, []net.Interface{{Index: 1, Name: "eth0"}})
+	s.service = newServiceEntry("test", "_test._tcp", "local")
 	s.service.Port = 8080
 	s.service.HostName = "test.local."
 
@@ -578,14 +642,8 @@ func TestServer_SetText(t *testing.T) {
 		}).Maybe()
 	mockIPv6.EXPECT().WriteTo(mock.Anything, mock.Anything, mock.Anything).Return(0, nil).Maybe()
 
-	s := &Server{
-		ipv4conn:       mockIPv4,
-		ipv6conn:       mockIPv6,
-		ifaces:         []net.Interface{{Index: 1, Name: "eth0"}},
-		shouldShutdown: make(chan struct{}),
-		ttl:            3200,
-		service:        newServiceEntry("test", "_test._tcp", "local"),
-	}
+	s := testServer(mockIPv4, mockIPv6, []net.Interface{{Index: 1, Name: "eth0"}})
+	s.service = newServiceEntry("test", "_test._tcp", "local")
 	s.service.Port = 8080
 	s.service.HostName = "test.local."
 	s.service.Text = []string{"old=value"}
@@ -626,14 +684,8 @@ func TestServer_HandleQuery_RespondsToQueries(t *testing.T) {
 		}).Maybe()
 	mockIPv6.EXPECT().WriteTo(mock.Anything, mock.Anything, mock.Anything).Return(0, nil).Maybe()
 
-	s := &Server{
-		ipv4conn:       mockIPv4,
-		ipv6conn:       mockIPv6,
-		ifaces:         []net.Interface{{Index: 1, Name: "eth0"}},
-		shouldShutdown: make(chan struct{}),
-		ttl:            3200,
-		service:        newServiceEntry("myservice", "_http._tcp", "local"),
-	}
+	s := testServer(mockIPv4, mockIPv6, []net.Interface{{Index: 1, Name: "eth0"}})
+	s.service = newServiceEntry("myservice", "_http._tcp", "local")
 	s.service.Port = 8080
 	s.service.HostName = "myhost.local."
 	s.service.Text = []string{"key=value"}
@@ -691,14 +743,8 @@ func TestServer_UnicastResponse(t *testing.T) {
 			return len(b), nil
 		}).Once()
 
-	s := &Server{
-		ipv4conn:       mockIPv4,
-		ipv6conn:       nil,
-		ifaces:         []net.Interface{{Index: 1, Name: "eth0"}},
-		shouldShutdown: make(chan struct{}),
-		ttl:            3200,
-		service:        newServiceEntry("myservice", "_http._tcp", "local"),
-	}
+	s := testServer(mockIPv4, nil, []net.Interface{{Index: 1, Name: "eth0"}})
+	s.service = newServiceEntry("myservice", "_http._tcp", "local")
 	s.service.Port = 8080
 	s.service.HostName = "myhost.local."
 

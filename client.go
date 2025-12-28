@@ -32,13 +32,16 @@ var initialQueryInterval = 4 * time.Second
 type Client struct {
 	ipv4conn api.PacketConn
 	ipv6conn api.PacketConn
-	ifaces   []net.Interface
+	ipv4Mgr  *InterfaceManager
+	ipv6Mgr  *InterfaceManager
+	provider api.InterfaceProvider
 }
 
 type clientOpts struct {
 	listenOn    IPType
 	ifaces      []net.Interface
 	connFactory api.ConnectionFactory
+	provider    api.InterfaceProvider
 }
 
 // ClientOption fills the option struct to configure intefaces, etc.
@@ -67,6 +70,14 @@ func SelectIfaces(ifaces []net.Interface) ClientOption {
 func WithClientConnFactory(factory api.ConnectionFactory) ClientOption {
 	return func(o *clientOpts) {
 		o.connFactory = factory
+	}
+}
+
+// WithClientInterfaceProvider sets a custom interface provider for the client.
+// This is primarily useful for testing with mock interface lists.
+func WithClientInterfaceProvider(provider api.InterfaceProvider) ClientOption {
+	return func(o *clientOpts) {
+		o.provider = provider
 	}
 }
 
@@ -119,7 +130,19 @@ func applyOpts(options ...ClientOption) clientOpts {
 }
 
 func (c *Client) run(ctx context.Context, params *lookupParams) error {
+	// Run immediate sync on startup to catch any interfaces that changed
+	// between client creation and run()
+	c.syncInterfaces()
+
 	ctx, cancel := context.WithCancel(ctx)
+
+	// Start interface sync in background
+	syncDone := make(chan struct{})
+	go func() {
+		defer close(syncDone)
+		c.runInterfaceSync(ctx)
+	}()
+
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -131,6 +154,7 @@ func (c *Client) run(ctx context.Context, params *lookupParams) error {
 	err := c.periodicQuery(ctx, params)
 	cancel()
 	<-done
+	<-syncDone
 	return err
 }
 
@@ -147,15 +171,36 @@ func NewClient(opts ...ClientOption) (*Client, error) {
 
 // newClient is the internal constructor that takes pre-applied options.
 func newClient(opts clientOpts) (*Client, error) {
+	// Get interface provider (use default if not injected for testing)
+	provider := opts.provider
+	if provider == nil {
+		provider = NewInterfaceProvider()
+	}
+
 	ifaces := opts.ifaces
-	if len(ifaces) == 0 {
-		ifaces = NewInterfaceProvider().MulticastInterfaces()
+	var requested []string
+
+	// Determine mode based on whether interfaces were explicitly provided
+	if len(ifaces) > 0 {
+		// Explicit mode: extract names for the manager
+		requested = make([]string, len(ifaces))
+		for i, iface := range ifaces {
+			requested[i] = iface.Name
+		}
+	} else {
+		// Dynamic mode: get current interfaces
+		ifaces = provider.MulticastInterfaces()
 	}
 
 	factory := opts.connFactory
 	if factory == nil {
 		factory = NewConnectionFactory()
 	}
+
+	// Create SEPARATE managers for IPv4 and IPv6.
+	// This ensures IPv6 failures don't affect IPv4 (and vice versa).
+	ipv4Mgr := NewInterfaceManager(ifaces, requested)
+	ipv6Mgr := NewInterfaceManager(ifaces, requested)
 
 	// IPv4 interfaces
 	var ipv4conn api.PacketConn
@@ -179,7 +224,9 @@ func newClient(opts clientOpts) (*Client, error) {
 	return &Client{
 		ipv4conn: ipv4conn,
 		ipv6conn: ipv6conn,
-		ifaces:   ifaces,
+		ipv4Mgr:  ipv4Mgr,
+		ipv6Mgr:  ipv6Mgr,
+		provider: provider,
 	}, nil
 }
 
@@ -450,26 +497,74 @@ func (c *Client) query(params *lookupParams) error {
 	return c.sendQuery(m)
 }
 
-// Pack the dns.Msg and write to available connections (multicast)
+// sendQuery packs the dns.Msg and writes to available connections (multicast).
+//
+// THE CRITICAL FIX: Dynamic iteration using ActiveIndices().
+// Gets a fresh snapshot of active indices on each call. The snapshot may become
+// stale during iteration (race with syncInterfaces), but this is BENIGN because:
+//   - Sends to removed indices fail immediately
+//   - MarkFailed is idempotent (safe to call on already-removed index)
+//   - New indices are picked up on the next sendQuery call
 func (c *Client) sendQuery(msg *dns.Msg) error {
 	buf, err := msg.Pack()
 	if err != nil {
 		return err
 	}
 
-	// Send to all interfaces via IPv4
+	// IPv4: iterate over CURRENT active indices
 	if c.ipv4conn != nil {
-		for _, iface := range c.ifaces {
-			_, _ = c.ipv4conn.WriteTo(buf, iface.Index, ipv4Addr)
+		for _, idx := range c.ipv4Mgr.ActiveIndices() {
+			if _, err := c.ipv4conn.WriteTo(buf, idx, ipv4Addr); err != nil {
+				c.ipv4Mgr.MarkFailed(idx, err)
+			}
 		}
 	}
 
-	// Send to all interfaces via IPv6
+	// IPv6: same pattern, separate manager
 	if c.ipv6conn != nil {
-		for _, iface := range c.ifaces {
-			_, _ = c.ipv6conn.WriteTo(buf, iface.Index, ipv6Addr)
+		for _, idx := range c.ipv6Mgr.ActiveIndices() {
+			if _, err := c.ipv6conn.WriteTo(buf, idx, ipv6Addr); err != nil {
+				c.ipv6Mgr.MarkFailed(idx, err)
+			}
 		}
 	}
 
 	return nil
+}
+
+// runInterfaceSync periodically polls for interface changes.
+func (c *Client) runInterfaceSync(ctx context.Context) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			c.syncInterfaces()
+		}
+	}
+}
+
+// syncInterfaces polls for interface changes and recovers interfaces.
+func (c *Client) syncInterfaces() {
+	current := c.provider.MulticastInterfaces()
+
+	// Helper to sync a single manager
+	syncManager := func(mgr *InterfaceManager, conn api.PacketConn, groupIP net.IP) {
+		if conn == nil || mgr == nil {
+			return
+		}
+		for _, iface := range mgr.Sync(current) {
+			if err := conn.JoinGroup(&iface, &net.UDPAddr{IP: groupIP}); err != nil {
+				mgr.SetBackoff(iface.Name)
+			} else {
+				mgr.Activate(iface)
+			}
+		}
+	}
+
+	syncManager(c.ipv4Mgr, c.ipv4conn, mdnsGroupIPv4)
+	syncManager(c.ipv6Mgr, c.ipv6conn, mdnsGroupIPv6)
 }
