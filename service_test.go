@@ -182,7 +182,8 @@ func TestSubtype(t *testing.T) {
 		initialQueryInterval = 100 * time.Millisecond
 		cleanupFreq = 100 * time.Millisecond
 
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// Use longer timeout for CI environments where timing can be inconsistent
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		startMDNS(t, mdnsPort, mdnsName, mdnsSubtype, mdnsDomain)
 

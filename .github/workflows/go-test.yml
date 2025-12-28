@@ -3,7 +3,7 @@ name: Go Test
 on:
   pull_request:
   push:
-    branches: ["master"]
+    branches: ["master", "dev"]
   workflow_dispatch:
 
 permissions:
@@ -14,5 +14,57 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  go-test:
-    uses: pl-strflt/uci/.github/workflows/go-test.yml@v0.0
+  # Full test suite on Ubuntu where mDNS multicast works
+  test:
+    strategy:
+      matrix:
+        go: ["1.22", "1.23"]
+      fail-fast: false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run tests
+        run: go test -v -race -coverprofile=coverage.txt -covermode=atomic ./...
+
+      - name: Upload coverage
+        if: matrix.go == '1.23'
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage.txt
+          fail_ci_if_error: false
+
+  # Build verification on other platforms (mDNS multicast doesn't work in CI)
+  build:
+    strategy:
+      matrix:
+        os: [macos-latest, windows-latest]
+        go: ["1.22", "1.23"]
+      fail-fast: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Build
+        run: go build ./...
+
+      - name: Run unit tests (no network)
+        run: go test -v -race -run "TestQuickShutdown|TestCPUSpinOnConnectionClose" ./...
