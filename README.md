@@ -22,24 +22,30 @@ Target environments: private LAN/Wifi, small or isolated networks.
 ## Install
 Nothing is as easy as that:
 ```bash
-$ go get -u github.com/enbility/zeroconf/v2
+$ go get -u github.com/enbility/zeroconf/v3
 ```
 
 ## Browse for services in your local network
 
 ```go
 entries := make(chan *zeroconf.ServiceEntry)
-go func(results <-chan *zeroconf.ServiceEntry) {
-    for entry := range results {
-        log.Println(entry)
+removed := make(chan *zeroconf.ServiceEntry)
+
+go func() {
+    for {
+        select {
+        case entry := <-entries:
+            log.Println("Found:", entry)
+        case entry := <-removed:
+            log.Println("Removed:", entry)
+        }
     }
-    log.Println("No more entries.")
-}(entries)
+}()
 
 ctx, cancel := context.WithTimeout(context.Background(), time.Second*15)
 defer cancel()
 // Discover all services on the network (e.g. _workstation._tcp)
-err = zeroconf.Browse(ctx, "_workstation._tcp", "local.", entries)
+err := zeroconf.Browse(ctx, "_workstation._tcp", "local.", entries, removed)
 if err != nil {
     log.Fatalln("Failed to browse:", err.Error())
 }
@@ -53,7 +59,23 @@ See https://github.com/enbility/zeroconf/blob/master/examples/resolv/client.go.
 ## Lookup a specific service instance
 
 ```go
-// Example filled soon.
+entries := make(chan *zeroconf.ServiceEntry)
+
+go func() {
+    for entry := range entries {
+        log.Println("Found:", entry)
+    }
+}()
+
+ctx, cancel := context.WithTimeout(context.Background(), time.Second*15)
+defer cancel()
+// Lookup a specific service instance by name
+err := zeroconf.Lookup(ctx, "MyService", "_workstation._tcp", "local.", entries)
+if err != nil {
+    log.Fatalln("Failed to lookup:", err.Error())
+}
+
+<-ctx.Done()
 ```
 
 ## Register a service
@@ -81,6 +103,29 @@ Multiple subtypes may be added to service name, separated by commas. E.g `_works
 
 See https://github.com/enbility/zeroconf/blob/master/examples/register/server.go.
 
+## Testing Support (v3)
+
+Version 3 introduces interface-based abstractions for improved testability. You can inject mock connections for unit testing without requiring real network access:
+
+```go
+// Create mock connections using the provided interfaces
+mockFactory := &MyMockConnectionFactory{}
+
+// Client with mock connections
+client, err := zeroconf.NewClient(zeroconf.WithClientConnFactory(mockFactory))
+
+// Server with mock connections
+server, err := zeroconf.RegisterProxy(
+    "MyService", "_http._tcp", "local.", 8080,
+    "myhost.local.", []string{"192.168.1.100"},
+    []string{"txtvers=1"},
+    nil, // interfaces
+    zeroconf.WithServerConnFactory(mockFactory),
+)
+```
+
+See the `api/` package for interface definitions and `mocks/` for mockery-generated mocks.
+
 ## Features and ToDo's
 This list gives a quick impression about the state of this library.
 See what needs to be done and submit a pull request :)
@@ -89,6 +134,8 @@ See what needs to be done and submit a pull request :)
 * [x] Multiple IPv6 / IPv4 addresses support
 * [x] Send multiple probes (exp. back-off) if no service answers (*)
 * [x] Timestamp entries for TTL checks
+* [x] Service removal notifications via `removed` channel
+* [x] Interface-based abstractions for testability (v3)
 * [ ] Compare new multicasts with already received services
 
 _Notes:_

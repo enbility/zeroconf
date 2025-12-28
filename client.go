@@ -3,17 +3,14 @@ package zeroconf
 import (
 	"context"
 	"fmt"
-	"log"
 	"math/rand"
 	"net"
 	"reflect"
-	"runtime"
 	"strings"
 	"time"
 
+	"github.com/enbility/zeroconf/v3/api"
 	"github.com/miekg/dns"
-	"golang.org/x/net/ipv4"
-	"golang.org/x/net/ipv6"
 )
 
 // IPType specifies the IP traffic the client listens for.
@@ -32,15 +29,16 @@ const (
 var initialQueryInterval = 4 * time.Second
 
 // Client structure encapsulates both IPv4/IPv6 UDP connections.
-type client struct {
-	ipv4conn *ipv4.PacketConn
-	ipv6conn *ipv6.PacketConn
+type Client struct {
+	ipv4conn api.PacketConn
+	ipv6conn api.PacketConn
 	ifaces   []net.Interface
 }
 
 type clientOpts struct {
-	listenOn IPType
-	ifaces   []net.Interface
+	listenOn    IPType
+	ifaces      []net.Interface
+	connFactory api.ConnectionFactory
 }
 
 // ClientOption fills the option struct to configure intefaces, etc.
@@ -61,6 +59,14 @@ func SelectIPTraffic(t IPType) ClientOption {
 func SelectIfaces(ifaces []net.Interface) ClientOption {
 	return func(o *clientOpts) {
 		o.ifaces = ifaces
+	}
+}
+
+// WithClientConnFactory sets a custom connection factory for the client.
+// This is primarily useful for testing with mock connections.
+func WithClientConnFactory(factory api.ConnectionFactory) ClientOption {
+	return func(o *clientOpts) {
+		o.connFactory = factory
 	}
 }
 
@@ -112,7 +118,7 @@ func applyOpts(options ...ClientOption) clientOpts {
 	return conf
 }
 
-func (c *client) run(ctx context.Context, params *lookupParams) error {
+func (c *Client) run(ctx context.Context, params *lookupParams) error {
 	ctx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	go func() {
@@ -133,32 +139,44 @@ func defaultParams(service string) *lookupParams {
 	return newLookupParams("", service, "local", false, make(chan *ServiceEntry), make(chan *ServiceEntry))
 }
 
-// Client structure constructor
-func newClient(opts clientOpts) (*client, error) {
+// NewClient creates a new mDNS client with the given options.
+// This is the low-level constructor. For most use cases, prefer Browse() or Lookup().
+func NewClient(opts ...ClientOption) (*Client, error) {
+	return newClient(applyOpts(opts...))
+}
+
+// newClient is the internal constructor that takes pre-applied options.
+func newClient(opts clientOpts) (*Client, error) {
 	ifaces := opts.ifaces
 	if len(ifaces) == 0 {
-		ifaces = listMulticastInterfaces()
+		ifaces = NewInterfaceProvider().MulticastInterfaces()
 	}
+
+	factory := opts.connFactory
+	if factory == nil {
+		factory = NewConnectionFactory()
+	}
+
 	// IPv4 interfaces
-	var ipv4conn *ipv4.PacketConn
+	var ipv4conn api.PacketConn
 	if (opts.listenOn & IPv4) > 0 {
 		var err error
-		ipv4conn, err = joinUdp4Multicast(ifaces)
+		ipv4conn, err = factory.CreateIPv4Conn(ifaces)
 		if err != nil {
 			return nil, err
 		}
 	}
 	// IPv6 interfaces
-	var ipv6conn *ipv6.PacketConn
+	var ipv6conn api.PacketConn
 	if (opts.listenOn & IPv6) > 0 {
 		var err error
-		ipv6conn, err = joinUdp6Multicast(ifaces)
+		ipv6conn, err = factory.CreateIPv6Conn(ifaces)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	return &client{
+	return &Client{
 		ipv4conn: ipv4conn,
 		ipv6conn: ipv6conn,
 		ifaces:   ifaces,
@@ -168,7 +186,7 @@ func newClient(opts clientOpts) (*client, error) {
 var cleanupFreq = 5 * time.Second
 
 // Start listeners and waits for the shutdown signal from exit channel
-func (c *client) mainloop(ctx context.Context, params *lookupParams) {
+func (c *Client) mainloop(ctx context.Context, params *lookupParams) {
 	// start listening for responses
 	msgCh := make(chan *dns.Msg, 32)
 	if c.ipv4conn != nil {
@@ -319,7 +337,7 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 }
 
 // Shutdown client will close currently open connections and channel implicitly.
-func (c *client) shutdown() {
+func (c *Client) shutdown() {
 	if c.ipv4conn != nil {
 		c.ipv4conn.Close()
 	}
@@ -330,22 +348,8 @@ func (c *client) shutdown() {
 
 // Data receiving routine reads from connection, unpacks packets into dns.Msg
 // structures and sends them to a given msgCh channel
-func (c *client) recv(ctx context.Context, l interface{}, msgCh chan *dns.Msg) {
-	var readFrom func([]byte) (n int, src net.Addr, err error)
-
-	switch pConn := l.(type) {
-	case *ipv6.PacketConn:
-		readFrom = func(b []byte) (n int, src net.Addr, err error) {
-			n, _, src, err = pConn.ReadFrom(b)
-			return
-		}
-	case *ipv4.PacketConn:
-		readFrom = func(b []byte) (n int, src net.Addr, err error) {
-			n, _, src, err = pConn.ReadFrom(b)
-			return
-		}
-
-	default:
+func (c *Client) recv(ctx context.Context, conn api.PacketConn, msgCh chan *dns.Msg) {
+	if conn == nil {
 		return
 	}
 
@@ -355,12 +359,11 @@ func (c *client) recv(ctx context.Context, l interface{}, msgCh chan *dns.Msg) {
 		// Handles the following cases:
 		// - ReadFrom aborts with error due to closed UDP connection -> causes ctx cancel
 		// - ReadFrom aborts otherwise.
-		// TODO: the context check can be removed. Verify!
 		if ctx.Err() != nil || fatalErr != nil {
 			return
 		}
 
-		n, _, err := readFrom(buf)
+		n, _, _, err := conn.ReadFrom(buf)
 		if err != nil {
 			fatalErr = err
 			continue
@@ -384,7 +387,7 @@ func (c *client) recv(ctx context.Context, l interface{}, msgCh chan *dns.Msg) {
 // the main processing loop or some timeout/cancel fires.
 // TODO: move error reporting to shutdown function as periodicQuery is called from
 // go routine context.
-func (c *client) periodicQuery(ctx context.Context, params *lookupParams) error {
+func (c *Client) periodicQuery(ctx context.Context, params *lookupParams) error {
 	// Do the first query immediately.
 	if err := c.query(params); err != nil {
 		return err
@@ -426,7 +429,7 @@ func (c *client) periodicQuery(ctx context.Context, params *lookupParams) error 
 
 // Performs the actual query by service name (browse) or service instance name (lookup),
 // start response listeners goroutines and loops over the entries channel.
-func (c *client) query(params *lookupParams) error {
+func (c *Client) query(params *lookupParams) error {
 	var serviceName, serviceInstanceName string
 	serviceName = fmt.Sprintf("%s.%s.", trimDot(params.Service), trimDot(params.Domain))
 
@@ -448,44 +451,25 @@ func (c *client) query(params *lookupParams) error {
 }
 
 // Pack the dns.Msg and write to available connections (multicast)
-func (c *client) sendQuery(msg *dns.Msg) error {
+func (c *Client) sendQuery(msg *dns.Msg) error {
 	buf, err := msg.Pack()
 	if err != nil {
 		return err
 	}
+
+	// Send to all interfaces via IPv4
 	if c.ipv4conn != nil {
-		// See https://pkg.go.dev/golang.org/x/net/ipv4#pkg-note-BUG
-		// As of Golang 1.18.4
-		// On Windows, the ControlMessage for ReadFrom and WriteTo methods of PacketConn is not implemented.
-		var wcm ipv4.ControlMessage
-		for ifi := range c.ifaces {
-			switch runtime.GOOS {
-			case "darwin", "ios", "linux":
-				wcm.IfIndex = c.ifaces[ifi].Index
-			default:
-				if err := c.ipv4conn.SetMulticastInterface(&c.ifaces[ifi]); err != nil {
-					log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
-				}
-			}
-			_, _ = c.ipv4conn.WriteTo(buf, &wcm, ipv4Addr)
+		for _, iface := range c.ifaces {
+			_, _ = c.ipv4conn.WriteTo(buf, iface.Index, ipv4Addr)
 		}
 	}
+
+	// Send to all interfaces via IPv6
 	if c.ipv6conn != nil {
-		// See https://pkg.go.dev/golang.org/x/net/ipv6#pkg-note-BUG
-		// As of Golang 1.18.4
-		// On Windows, the ControlMessage for ReadFrom and WriteTo methods of PacketConn is not implemented.
-		var wcm ipv6.ControlMessage
-		for ifi := range c.ifaces {
-			switch runtime.GOOS {
-			case "darwin", "ios", "linux":
-				wcm.IfIndex = c.ifaces[ifi].Index
-			default:
-				if err := c.ipv6conn.SetMulticastInterface(&c.ifaces[ifi]); err != nil {
-					log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
-				}
-			}
-			_, _ = c.ipv6conn.WriteTo(buf, &wcm, ipv6Addr)
+		for _, iface := range c.ifaces {
+			_, _ = c.ipv6conn.WriteTo(buf, iface.Index, ipv6Addr)
 		}
 	}
+
 	return nil
 }
