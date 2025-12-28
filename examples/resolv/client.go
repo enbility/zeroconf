@@ -6,7 +6,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/enbility/zeroconf/v2"
+	"github.com/enbility/zeroconf/v3"
 )
 
 var (

@@ -1,4 +1,4 @@
-module github.com/enbility/zeroconf/v2
+module github.com/enbility/zeroconf/v3
 
 go 1.22.0
 
