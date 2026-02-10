@@ -842,6 +842,21 @@ func (s *Server) runInterfaceSync() {
 // syncInterfaces updates both interface managers with current system state.
 func (s *Server) syncInterfaces() {
 	current := s.provider.MulticastInterfaces()
-	s.ipv4Mgr.Sync(current)
-	s.ipv6Mgr.Sync(current)
+
+	// Helper to sync a single manager
+	syncManager := func(mgr *InterfaceManager, conn api.PacketConn, groupIP net.IP) {
+		if conn == nil || mgr == nil {
+			return
+		}
+		for _, iface := range mgr.Sync(current) {
+			if err := conn.JoinGroup(&iface, &net.UDPAddr{IP: groupIP}); err != nil {
+				mgr.SetBackoff(iface.Name)
+			} else {
+				mgr.Activate(iface)
+			}
+		}
+	}
+
+	syncManager(s.ipv4Mgr, s.ipv4conn, mdnsGroupIPv4)
+	syncManager(s.ipv6Mgr, s.ipv6conn, mdnsGroupIPv6)
 }

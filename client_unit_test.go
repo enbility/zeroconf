@@ -265,6 +265,73 @@ func TestClient_Shutdown_ClosesConnections(t *testing.T) {
 	c.shutdown()
 }
 
+// TestClient_SyncInterfaces_JoinGroupSuccessActivates verifies syncInterfaces joins and activates.
+func TestClient_SyncInterfaces_JoinGroupSuccessActivates(t *testing.T) {
+	mockIPv4 := mocks.NewMockPacketConn(t)
+	mockProvider := mocks.NewMockInterfaceProvider(t)
+
+	iface := net.Interface{Index: 2, Name: "wlan0"}
+
+	mockProvider.EXPECT().MulticastInterfaces().Return([]net.Interface{iface}).Once()
+	mockIPv4.EXPECT().JoinGroup(mock.AnythingOfType("*net.Interface"), mock.Anything).RunAndReturn(
+		func(ifi *net.Interface, group net.Addr) error {
+			if ifi == nil || ifi.Index != iface.Index || ifi.Name != iface.Name {
+				t.Errorf("expected JoinGroup on %+v, got %+v", iface, ifi)
+			}
+			udpAddr, ok := group.(*net.UDPAddr)
+			if !ok || udpAddr == nil || !udpAddr.IP.Equal(mdnsGroupIPv4) {
+				t.Errorf("expected IPv4 group %v, got %v", mdnsGroupIPv4, group)
+			}
+			return nil
+		}).Once()
+
+	c := &Client{
+		ipv4conn: mockIPv4,
+		ipv4Mgr:  NewInterfaceManager(nil, nil),
+		ipv6Mgr:  NewInterfaceManager(nil, nil),
+		provider: mockProvider,
+	}
+
+	c.syncInterfaces()
+
+	indices := c.ipv4Mgr.ActiveIndices()
+	if len(indices) != 1 || indices[0] != iface.Index {
+		t.Errorf("expected active indices [2], got %v", indices)
+	}
+}
+
+// TestClient_SyncInterfaces_JoinGroupFailureSetsBackoff verifies JoinGroup failure triggers backoff.
+func TestClient_SyncInterfaces_JoinGroupFailureSetsBackoff(t *testing.T) {
+	mockIPv6 := mocks.NewMockPacketConn(t)
+	mockProvider := mocks.NewMockInterfaceProvider(t)
+
+	iface := net.Interface{Index: 3, Name: "eth0"}
+
+	mockProvider.EXPECT().MulticastInterfaces().Return([]net.Interface{iface}).Once()
+	mockIPv6.EXPECT().JoinGroup(mock.AnythingOfType("*net.Interface"), mock.Anything).Return(syscall.ENETDOWN).Once()
+
+	c := &Client{
+		ipv6conn: mockIPv6,
+		ipv4Mgr:  NewInterfaceManager(nil, nil),
+		ipv6Mgr:  NewInterfaceManager(nil, nil),
+		provider: mockProvider,
+	}
+
+	c.syncInterfaces()
+
+	indices := c.ipv6Mgr.ActiveIndices()
+	if len(indices) != 0 {
+		t.Errorf("expected no active indices after JoinGroup failure, got %v", indices)
+	}
+
+	c.ipv6Mgr.mu.RLock()
+	_, hasFailure := c.ipv6Mgr.failures[iface.Name]
+	c.ipv6Mgr.mu.RUnlock()
+	if !hasFailure {
+		t.Errorf("expected backoff failure state for %s", iface.Name)
+	}
+}
+
 // TestClientConfig verifies client configuration options
 func TestClientConfig(t *testing.T) {
 	t.Run("default options", func(t *testing.T) {
