@@ -27,6 +27,76 @@ func testClient(ipv4conn, ipv6conn api.PacketConn, ifaces []net.Interface) *Clie
 	}
 }
 
+func TestClient_NewClient_IPv4AndIPv6Error(t *testing.T) {
+	ifaces := []net.Interface{{Index: 1, Name: "eth0"}}
+
+	mockFactory := mocks.NewMockConnectionFactory(t)
+	mockIPv4 := mocks.NewMockPacketConn(t)
+
+	mockFactory.EXPECT().CreateIPv4Conn(ifaces).Return(mockIPv4, nil).Once()
+	mockFactory.EXPECT().CreateIPv6Conn(ifaces).Return(nil, errors.New("IPv6 unavailable")).Once()
+
+	cl, err := newClient(applyOpts(
+		SelectIPTraffic(IPv4AndIPv6),
+		SelectIfaces(ifaces),
+		WithClientConnFactory(mockFactory),
+	))
+	if err != nil {
+		t.Fatalf("newClient failed: %v", err)
+	}
+	if cl.ipv4conn != mockIPv4 {
+		t.Fatalf("expected IPv4 connection to be set")
+	}
+	if cl.ipv6conn != nil {
+		t.Fatalf("expected IPv6 connection to be nil")
+	}
+}
+
+func TestClient_NewClient_IPv6AndIPv4Error(t *testing.T) {
+	ifaces := []net.Interface{{Index: 1, Name: "eth0"}}
+
+	mockFactory := mocks.NewMockConnectionFactory(t)
+	mockIPv6 := mocks.NewMockPacketConn(t)
+
+	mockFactory.EXPECT().CreateIPv4Conn(ifaces).Return(nil, errors.New("IPv4 unavailable")).Once()
+	mockFactory.EXPECT().CreateIPv6Conn(ifaces).Return(mockIPv6, nil).Once()
+
+	cl, err := newClient(applyOpts(
+		SelectIPTraffic(IPv4AndIPv6),
+		SelectIfaces(ifaces),
+		WithClientConnFactory(mockFactory),
+	))
+	if err != nil {
+		t.Fatalf("newClient failed: %v", err)
+	}
+	if cl.ipv4conn != nil {
+		t.Fatalf("expected IPv4 connection to be nil")
+	}
+	if cl.ipv6conn != mockIPv6 {
+		t.Fatalf("expected IPv6 connection to be set")
+	}
+}
+
+func TestClient_NewClient_IPv4ErrorAndIPv6Error(t *testing.T) {
+	ifaces := []net.Interface{{Index: 1, Name: "eth0"}}
+
+	mockFactory := mocks.NewMockConnectionFactory(t)
+	mockFactory.EXPECT().CreateIPv4Conn(ifaces).Return(nil, errors.New("IPv4 unavailable")).Once()
+	mockFactory.EXPECT().CreateIPv6Conn(ifaces).Return(nil, errors.New("IPv6 unavailable")).Once()
+
+	cl, err := newClient(applyOpts(
+		SelectIPTraffic(IPv4AndIPv6),
+		SelectIfaces(ifaces),
+		WithClientConnFactory(mockFactory),
+	))
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+	if cl != nil {
+		t.Fatalf("expected client to be nil on error")
+	}
+}
+
 // TestClient_InterfaceDisconnect_StopsSendingToFailedInterface is the key integration test
 // that verifies the fix for the original issue: when an interface disconnects, we should
 // stop sending to it rather than generating infinite warning logs.

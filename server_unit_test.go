@@ -104,6 +104,64 @@ func testServer(ipv4conn, ipv6conn api.PacketConn, ifaces []net.Interface) *Serv
 	}
 }
 
+func TestServer_NewServer_IPv4AndIPv6Error(t *testing.T) {
+	ifaces := []net.Interface{{Index: 1, Name: "eth0"}}
+
+	mockFactory := mocks.NewMockConnectionFactory(t)
+	mockIPv4 := mocks.NewMockPacketConn(t)
+
+	mockFactory.EXPECT().CreateIPv4Conn(ifaces).Return(mockIPv4, nil).Once()
+	mockFactory.EXPECT().CreateIPv6Conn(ifaces).Return(nil, errors.New("IPv6 unavailable")).Once()
+
+	s, err := newServer(ifaces, applyServerOpts(WithServerConnFactory(mockFactory)))
+	if err != nil {
+		t.Fatalf("newServer failed: %v", err)
+	}
+	if s.ipv4conn != mockIPv4 {
+		t.Fatalf("expected IPv4 connection to be set")
+	}
+	if s.ipv6conn != nil {
+		t.Fatalf("expected IPv6 connection to be nil")
+	}
+}
+
+func TestServer_NewServer_IPv6AndIPv4Error(t *testing.T) {
+	ifaces := []net.Interface{{Index: 1, Name: "eth0"}}
+
+	mockFactory := mocks.NewMockConnectionFactory(t)
+	mockIPv6 := mocks.NewMockPacketConn(t)
+
+	mockFactory.EXPECT().CreateIPv4Conn(ifaces).Return(nil, errors.New("IPv4 unavailable")).Once()
+	mockFactory.EXPECT().CreateIPv6Conn(ifaces).Return(mockIPv6, nil).Once()
+
+	s, err := newServer(ifaces, applyServerOpts(WithServerConnFactory(mockFactory)))
+	if err != nil {
+		t.Fatalf("newServer failed: %v", err)
+	}
+	if s.ipv4conn != nil {
+		t.Fatalf("expected IPv4 connection to be nil")
+	}
+	if s.ipv6conn != mockIPv6 {
+		t.Fatalf("expected IPv6 connection to be set")
+	}
+}
+
+func TestServer_NewServer_IPv4ErrorAndIPv6Error(t *testing.T) {
+	ifaces := []net.Interface{{Index: 1, Name: "eth0"}}
+
+	mockFactory := mocks.NewMockConnectionFactory(t)
+	mockFactory.EXPECT().CreateIPv4Conn(ifaces).Return(nil, errors.New("IPv4 unavailable")).Once()
+	mockFactory.EXPECT().CreateIPv6Conn(ifaces).Return(nil, errors.New("IPv6 unavailable")).Once()
+
+	s, err := newServer(ifaces, applyServerOpts(WithServerConnFactory(mockFactory)))
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+	if s != nil {
+		t.Fatalf("expected server to be nil on error")
+	}
+}
+
 // TestServer_InterfaceDisconnect_StopsSendingToFailedInterface verifies that when
 // a network interface disconnects during multicast response, the server stops
 // attempting to send to that interface. This is the server-side fix for the

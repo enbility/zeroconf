@@ -3,6 +3,7 @@ package zeroconf
 import (
 	"context"
 	"fmt"
+	"log"
 	"math/rand"
 	"net"
 	"reflect"
@@ -204,21 +205,25 @@ func newClient(opts clientOpts) (*Client, error) {
 
 	// IPv4 interfaces
 	var ipv4conn api.PacketConn
+	var err4 error
 	if (opts.listenOn & IPv4) > 0 {
-		var err error
-		ipv4conn, err = factory.CreateIPv4Conn(ifaces)
-		if err != nil {
-			return nil, err
+		ipv4conn, err4 = factory.CreateIPv4Conn(ifaces)
+		if err4 != nil {
+			log.Printf("[zeroconf] no suitable IPv4 interface: %s", err4.Error())
 		}
 	}
 	// IPv6 interfaces
 	var ipv6conn api.PacketConn
+	var err6 error
 	if (opts.listenOn & IPv6) > 0 {
-		var err error
-		ipv6conn, err = factory.CreateIPv6Conn(ifaces)
-		if err != nil {
-			return nil, err
+		ipv6conn, err6 = factory.CreateIPv6Conn(ifaces)
+		if err6 != nil {
+			log.Printf("[zeroconf] no suitable IPv6 interface: %s", err6.Error())
 		}
+	}
+
+	if err4 != nil && err6 != nil {
+		return nil, fmt.Errorf("no supported interface")
 	}
 
 	return &Client{
