@@ -32,7 +32,7 @@ jobs:
         run: go test -race -v -coverprofile=coverage_temp.out  -covermode=atomic ./...
 
       - name: Remove mocks and examples from coverage
-        run: grep -v -e "/zeroconf/mocks/" -e "/zeroconf/examples/" coverage_temp.out > coverage.out
+        run: grep -vE "/zeroconf/v[0-9]+/(mocks|examples)/" coverage_temp.out > coverage.out
 
       - name: Send coverage
         uses: coverallsapp/github-action@v2
