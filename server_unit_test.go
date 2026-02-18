@@ -901,3 +901,108 @@ func TestServer_UnicastResponse(t *testing.T) {
 		}
 	}
 }
+
+// helper function to extract interface names from a slice of net.Interface for easy lookup in tests
+func ifaceNames(ifaces []net.Interface) map[string]bool {
+	m := make(map[string]bool, len(ifaces))
+	for _, iface := range ifaces {
+		m[iface.Name] = true
+	}
+	return m
+}
+
+func TestMergeInterfaces_BothEmpty(t *testing.T) {
+	result := mergeInterfaces(nil, nil)
+	if len(result) != 0 {
+		t.Fatalf("expected empty result, got %d", len(result))
+	}
+}
+
+func TestMergeInterfaces_IPv4EmptyIPv6NotEmpty(t *testing.T) {
+	ipv6 := []net.Interface{
+		{Index: 1, Name: "eth0"},
+		{Index: 2, Name: "eth1"},
+	}
+	result := mergeInterfaces(nil, ipv6)
+	if len(result) != 2 {
+		t.Fatalf("expected 2 interfaces, got %d", len(result))
+	}
+	names := ifaceNames(result)
+	if !names["eth0"] || !names["eth1"] {
+		t.Fatalf("expected eth0 and eth1, got %v", names)
+	}
+}
+
+func TestMergeInterfaces_IPv6EmptyIPv4NotEmpty(t *testing.T) {
+	ipv4 := []net.Interface{
+		{Index: 1, Name: "eth0"},
+		{Index: 2, Name: "eth1"},
+	}
+	result := mergeInterfaces(ipv4, nil)
+	if len(result) != 2 {
+		t.Fatalf("expected 2 interfaces, got %d", len(result))
+	}
+	names := ifaceNames(result)
+	if !names["eth0"] || !names["eth1"] {
+		t.Fatalf("expected eth0 and eth1, got %v", names)
+	}
+}
+
+func TestMergeInterfaces_NoOverlap(t *testing.T) {
+	ipv4 := []net.Interface{
+		{Index: 5, Name: "eth1"},
+		{Index: 10, Name: "eth2"},
+	}
+	ipv6 := []net.Interface{
+		{Index: 1, Name: "lo"},
+		{Index: 3, Name: "wlan0"},
+	}
+	result := mergeInterfaces(ipv4, ipv6)
+	if len(result) != 4 {
+		t.Fatalf("expected 4 interfaces, got %d", len(result))
+	}
+	names := ifaceNames(result)
+	for _, expected := range []string{"lo", "wlan0", "eth1", "eth2"} {
+		if !names[expected] {
+			t.Fatalf("expected %s in result, got %v", expected, names)
+		}
+	}
+}
+
+func TestMergeInterfaces_PartialOverlap(t *testing.T) {
+	ipv4 := []net.Interface{
+		{Index: 1, Name: "eth0"},
+		{Index: 2, Name: "eth1"},
+	}
+	ipv6 := []net.Interface{
+		{Index: 2, Name: "eth1"},
+		{Index: 3, Name: "wlan0"},
+	}
+	result := mergeInterfaces(ipv4, ipv6)
+	if len(result) != 3 {
+		t.Fatalf("expected 3 interfaces, got %d", len(result))
+	}
+	names := ifaceNames(result)
+	if !names["eth0"] || !names["eth1"] || !names["wlan0"] {
+		t.Fatalf("expected eth0, eth1, wlan0, got %v", names)
+	}
+}
+
+func TestMergeInterfaces_FullOverlap(t *testing.T) {
+	ipv4 := []net.Interface{
+		{Index: 1, Name: "eth0"},
+		{Index: 2, Name: "wlan0"},
+	}
+	ipv6 := []net.Interface{
+		{Index: 1, Name: "eth0"},
+		{Index: 2, Name: "wlan0"},
+	}
+	result := mergeInterfaces(ipv4, ipv6)
+	if len(result) != 2 {
+		t.Fatalf("expected 2 interfaces, got %d", len(result))
+	}
+	names := ifaceNames(result)
+	if !names["eth0"] || !names["wlan0"] {
+		t.Fatalf("expected eth0 and wlan0, got %v", names)
+	}
+}

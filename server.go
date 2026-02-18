@@ -631,10 +631,10 @@ func (s *Server) probe() {
 	timeout := time.Second
 	for i := 0; i < multicastRepetitions; i++ {
 		// Use active interfaces from both managers
-		activeIfaces := s.ipv4Mgr.GetActiveInterfaces()
-		if len(activeIfaces) == 0 {
-			activeIfaces = s.ipv6Mgr.GetActiveInterfaces()
-		}
+		ipv4ActiveIfaces := s.ipv4Mgr.GetActiveInterfaces()
+		ipv6ActiveIfaces := s.ipv6Mgr.GetActiveInterfaces()
+
+		activeIfaces := mergeInterfaces(ipv4ActiveIfaces, ipv6ActiveIfaces)
 		for _, intf := range activeIfaces {
 			resp := new(dns.Msg)
 			resp.MsgHdr.Response = true
@@ -859,4 +859,26 @@ func (s *Server) syncInterfaces() {
 
 	syncManager(s.ipv4Mgr, s.ipv4conn, mdnsGroupIPv4)
 	syncManager(s.ipv6Mgr, s.ipv6conn, mdnsGroupIPv6)
+}
+
+func mergeInterfaces(ipv4Ifaces, ipv6Ifaces []net.Interface) []net.Interface {
+	ifacesMap := make(map[string]net.Interface)
+	// add all IPv4 interfaces
+	for _, intf := range ipv4Ifaces {
+		ifacesMap[intf.Name] = intf
+	}
+
+	// check for IPv6 interfaces that are not supporting IPv4 and adding them
+	for _, intf := range ipv6Ifaces {
+		if _, exists := ifacesMap[intf.Name]; !exists {
+			ifacesMap[intf.Name] = intf
+		}
+	}
+
+	// merge interfaces
+	merged := make([]net.Interface, 0, len(ifacesMap))
+	for _, intf := range ifacesMap {
+		merged = append(merged, intf)
+	}
+	return merged
 }
