@@ -24,6 +24,7 @@ var defaultTTL uint32 = 3200
 type serverOpts struct {
 	ttl         uint32
 	connFactory api.ConnectionFactory
+	provider    api.InterfaceProvider
 }
 
 func applyServerOpts(options ...ServerOption) serverOpts {
@@ -54,6 +55,14 @@ func TTL(ttl uint32) ServerOption {
 func WithServerConnFactory(factory api.ConnectionFactory) ServerOption {
 	return func(o *serverOpts) {
 		o.connFactory = factory
+	}
+}
+
+// WithServerInterfaceProvider sets a custom interface provider for the server.
+// This is primarily useful for testing with mock interface lists.
+func WithServerInterfaceProvider(provider api.InterfaceProvider) ServerOption {
+	return func(o *serverOpts) {
+		o.provider = provider
 	}
 }
 
@@ -179,7 +188,9 @@ type Server struct {
 	service  *ServiceEntry
 	ipv4conn api.PacketConn
 	ipv6conn api.PacketConn
-	ifaces   []net.Interface
+	ipv4Mgr  *InterfaceManager
+	ipv6Mgr  *InterfaceManager
+	provider api.InterfaceProvider
 
 	shouldShutdown chan struct{}
 	shutdownLock   sync.Mutex
@@ -190,10 +201,31 @@ type Server struct {
 
 // Constructs server structure
 func newServer(ifaces []net.Interface, opts serverOpts) (*Server, error) {
+	// Get interface provider (use default if not injected for testing)
+	provider := opts.provider
+	if provider == nil {
+		provider = NewInterfaceProvider()
+	}
+
 	factory := opts.connFactory
 	if factory == nil {
 		factory = NewConnectionFactory()
 	}
+
+	// Determine mode
+	var requested []string
+	if len(ifaces) > 0 {
+		requested = make([]string, len(ifaces))
+		for i, iface := range ifaces {
+			requested[i] = iface.Name
+		}
+	} else {
+		ifaces = provider.MulticastInterfaces()
+	}
+
+	// Create SEPARATE managers for IPv4 and IPv6.
+	ipv4Mgr := NewInterfaceManager(ifaces, requested)
+	ipv6Mgr := NewInterfaceManager(ifaces, requested)
 
 	ipv4conn, err4 := factory.CreateIPv4Conn(ifaces)
 	if err4 != nil {
@@ -211,7 +243,9 @@ func newServer(ifaces []net.Interface, opts serverOpts) (*Server, error) {
 	s := &Server{
 		ipv4conn:       ipv4conn,
 		ipv6conn:       ipv6conn,
-		ifaces:         ifaces,
+		ipv4Mgr:        ipv4Mgr,
+		ipv6Mgr:        ipv6Mgr,
+		provider:       provider,
 		ttl:            opts.ttl,
 		shouldShutdown: make(chan struct{}),
 	}
@@ -230,6 +264,10 @@ func (s *Server) start() {
 	}
 	s.refCount.Add(1)
 	go s.probe()
+
+	// Start interface sync goroutine
+	s.refCount.Add(1)
+	go s.runInterfaceSync()
 }
 
 // SetText updates and announces the TXT records
@@ -592,7 +630,12 @@ func (s *Server) probe() {
 	//    at least a factor of two with every response sent.
 	timeout := time.Second
 	for i := 0; i < multicastRepetitions; i++ {
-		for _, intf := range s.ifaces {
+		// Use active interfaces from both managers
+		ipv4ActiveIfaces := s.ipv4Mgr.GetActiveInterfaces()
+		ipv6ActiveIfaces := s.ipv6Mgr.GetActiveInterfaces()
+
+		activeIfaces := mergeInterfaces(ipv4ActiveIfaces, ipv6ActiveIfaces)
+		for _, intf := range activeIfaces {
 			resp := new(dns.Msg)
 			resp.MsgHdr.Response = true
 			// TODO: make response authoritative if we are the publisher
@@ -735,27 +778,33 @@ func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int) error {
 		return fmt.Errorf("failed to pack msg %v: %w", msg, err)
 	}
 
-	// Determine which interfaces to send to
-	var ifaces []int
-	if ifIndex != 0 {
-		ifaces = []int{ifIndex}
-	} else {
-		for _, intf := range s.ifaces {
-			ifaces = append(ifaces, intf.Index)
-		}
-	}
-
 	// Send to IPv4 multicast group
 	if s.ipv4conn != nil {
-		for _, idx := range ifaces {
-			_, _ = s.ipv4conn.WriteTo(buf, idx, ipv4Addr)
+		var indices []int
+		if ifIndex != 0 {
+			indices = []int{ifIndex}
+		} else {
+			indices = s.ipv4Mgr.ActiveIndices()
+		}
+		for _, idx := range indices {
+			if _, err := s.ipv4conn.WriteTo(buf, idx, ipv4Addr); err != nil {
+				s.ipv4Mgr.MarkFailed(idx, err)
+			}
 		}
 	}
 
 	// Send to IPv6 multicast group
 	if s.ipv6conn != nil {
-		for _, idx := range ifaces {
-			_, _ = s.ipv6conn.WriteTo(buf, idx, ipv6Addr)
+		var indices []int
+		if ifIndex != 0 {
+			indices = []int{ifIndex}
+		} else {
+			indices = s.ipv6Mgr.ActiveIndices()
+		}
+		for _, idx := range indices {
+			if _, err := s.ipv6conn.WriteTo(buf, idx, ipv6Addr); err != nil {
+				s.ipv6Mgr.MarkFailed(idx, err)
+			}
 		}
 	}
 
@@ -770,4 +819,66 @@ func isUnicastQuestion(q dns.Question) bool {
 	//    qclass field is used to indicate that unicast responses are preferred
 	//    for this particular question.  (See Section 5.4.)
 	return q.Qclass&qClassCacheFlush != 0
+}
+
+// runInterfaceSync periodically syncs the interface managers with the current
+// system interface state, detecting recovered interfaces.
+func (s *Server) runInterfaceSync() {
+	defer s.refCount.Done()
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.shouldShutdown:
+			return
+		case <-ticker.C:
+			s.syncInterfaces()
+		}
+	}
+}
+
+// syncInterfaces updates both interface managers with current system state.
+func (s *Server) syncInterfaces() {
+	current := s.provider.MulticastInterfaces()
+
+	// Helper to sync a single manager
+	syncManager := func(mgr *InterfaceManager, conn api.PacketConn, groupIP net.IP) {
+		if conn == nil || mgr == nil {
+			return
+		}
+		for _, iface := range mgr.Sync(current) {
+			if err := conn.JoinGroup(&iface, &net.UDPAddr{IP: groupIP}); err != nil {
+				mgr.SetBackoff(iface.Name)
+			} else {
+				mgr.Activate(iface)
+			}
+		}
+	}
+
+	syncManager(s.ipv4Mgr, s.ipv4conn, mdnsGroupIPv4)
+	syncManager(s.ipv6Mgr, s.ipv6conn, mdnsGroupIPv6)
+}
+
+func mergeInterfaces(ipv4Ifaces, ipv6Ifaces []net.Interface) []net.Interface {
+	ifacesMap := make(map[string]net.Interface)
+	// add all IPv4 interfaces
+	for _, intf := range ipv4Ifaces {
+		ifacesMap[intf.Name] = intf
+	}
+
+	// check for IPv6 interfaces that are not supporting IPv4 and adding them
+	for _, intf := range ipv6Ifaces {
+		if _, exists := ifacesMap[intf.Name]; !exists {
+			ifacesMap[intf.Name] = intf
+		}
+	}
+
+	// merge interfaces
+	merged := make([]net.Interface, 0, len(ifacesMap))
+	for _, intf := range ifacesMap {
+		merged = append(merged, intf)
+	}
+	return merged
 }

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -89,6 +90,145 @@ func TestServer_Recv_ProcessesPacket(t *testing.T) {
 	}
 }
 
+// testServer creates a Server with InterfaceManagers for testing.
+// This helper avoids direct struct construction with the removed ifaces field.
+func testServer(ipv4conn, ipv6conn api.PacketConn, ifaces []net.Interface) *Server {
+	return &Server{
+		ipv4conn:       ipv4conn,
+		ipv6conn:       ipv6conn,
+		ipv4Mgr:        NewInterfaceManager(ifaces, nil),
+		ipv6Mgr:        NewInterfaceManager(ifaces, nil),
+		provider:       NewInterfaceProvider(),
+		shouldShutdown: make(chan struct{}),
+		ttl:            3200,
+	}
+}
+
+func TestServer_NewServer_IPv4AndIPv6Error(t *testing.T) {
+	ifaces := []net.Interface{{Index: 1, Name: "eth0"}}
+
+	mockFactory := mocks.NewMockConnectionFactory(t)
+	mockIPv4 := mocks.NewMockPacketConn(t)
+
+	mockFactory.EXPECT().CreateIPv4Conn(ifaces).Return(mockIPv4, nil).Once()
+	mockFactory.EXPECT().CreateIPv6Conn(ifaces).Return(nil, errors.New("IPv6 unavailable")).Once()
+
+	s, err := newServer(ifaces, applyServerOpts(WithServerConnFactory(mockFactory)))
+	if err != nil {
+		t.Fatalf("newServer failed: %v", err)
+	}
+	if s.ipv4conn != mockIPv4 {
+		t.Fatalf("expected IPv4 connection to be set")
+	}
+	if s.ipv6conn != nil {
+		t.Fatalf("expected IPv6 connection to be nil")
+	}
+}
+
+func TestServer_NewServer_IPv6AndIPv4Error(t *testing.T) {
+	ifaces := []net.Interface{{Index: 1, Name: "eth0"}}
+
+	mockFactory := mocks.NewMockConnectionFactory(t)
+	mockIPv6 := mocks.NewMockPacketConn(t)
+
+	mockFactory.EXPECT().CreateIPv4Conn(ifaces).Return(nil, errors.New("IPv4 unavailable")).Once()
+	mockFactory.EXPECT().CreateIPv6Conn(ifaces).Return(mockIPv6, nil).Once()
+
+	s, err := newServer(ifaces, applyServerOpts(WithServerConnFactory(mockFactory)))
+	if err != nil {
+		t.Fatalf("newServer failed: %v", err)
+	}
+	if s.ipv4conn != nil {
+		t.Fatalf("expected IPv4 connection to be nil")
+	}
+	if s.ipv6conn != mockIPv6 {
+		t.Fatalf("expected IPv6 connection to be set")
+	}
+}
+
+func TestServer_NewServer_IPv4ErrorAndIPv6Error(t *testing.T) {
+	ifaces := []net.Interface{{Index: 1, Name: "eth0"}}
+
+	mockFactory := mocks.NewMockConnectionFactory(t)
+	mockFactory.EXPECT().CreateIPv4Conn(ifaces).Return(nil, errors.New("IPv4 unavailable")).Once()
+	mockFactory.EXPECT().CreateIPv6Conn(ifaces).Return(nil, errors.New("IPv6 unavailable")).Once()
+
+	s, err := newServer(ifaces, applyServerOpts(WithServerConnFactory(mockFactory)))
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+	if s != nil {
+		t.Fatalf("expected server to be nil on error")
+	}
+}
+
+// TestServer_InterfaceDisconnect_StopsSendingToFailedInterface verifies that when
+// a network interface disconnects during multicast response, the server stops
+// attempting to send to that interface. This is the server-side fix for the
+// infinite warning log issue.
+func TestServer_InterfaceDisconnect_StopsSendingToFailedInterface(t *testing.T) {
+	mockIPv4 := mocks.NewMockPacketConn(t)
+
+	// Two interfaces: eth0 (will fail) and wlan0 (stays healthy)
+	ifaces := []net.Interface{
+		{Index: 1, Name: "eth0"},
+		{Index: 2, Name: "wlan0"},
+	}
+
+	// Track calls per interface
+	var mu sync.Mutex
+	callsToEth0 := 0
+	callsToWlan0 := 0
+
+	// eth0 (index 1) returns ENETDOWN, wlan0 (index 2) succeeds
+	mockIPv4.EXPECT().WriteTo(mock.Anything, mock.AnythingOfType("int"), mock.Anything).RunAndReturn(
+		func(b []byte, ifIndex int, dst net.Addr) (int, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if ifIndex == 1 {
+				callsToEth0++
+				return 0, syscall.ENETDOWN
+			}
+			callsToWlan0++
+			return len(b), nil
+		}).Maybe()
+
+	s := testServer(mockIPv4, nil, ifaces)
+
+	msg := new(dns.Msg)
+	msg.SetQuestion("_test._tcp.local.", dns.TypePTR)
+
+	// First multicast: both interfaces attempted
+	_ = s.multicastResponse(msg, 0)
+
+	mu.Lock()
+	firstEth0 := callsToEth0
+	firstWlan0 := callsToWlan0
+	mu.Unlock()
+
+	if firstEth0 != 1 || firstWlan0 != 1 {
+		t.Errorf("First response: expected 1 call each, got eth0=%d wlan0=%d", firstEth0, firstWlan0)
+	}
+
+	// Second multicast: eth0 should be excluded
+	_ = s.multicastResponse(msg, 0)
+
+	mu.Lock()
+	secondEth0 := callsToEth0
+	secondWlan0 := callsToWlan0
+	mu.Unlock()
+
+	if secondEth0 != 1 {
+		t.Errorf("Second response: eth0 should NOT be called again, got %d total calls", secondEth0)
+	}
+	if secondWlan0 != 2 {
+		t.Errorf("Second response: wlan0 should have 2 calls, got %d", secondWlan0)
+	}
+
+	t.Logf("SUCCESS: Server stops sending to disconnected interface")
+	t.Logf("eth0 calls: %d, wlan0 calls: %d", secondEth0, secondWlan0)
+}
+
 // TestServer_MulticastResponse_WritesToConnections verifies multicast sends to both connections
 func TestServer_MulticastResponse_WritesToConnections(t *testing.T) {
 	mockIPv4 := mocks.NewMockPacketConn(t)
@@ -100,13 +240,7 @@ func TestServer_MulticastResponse_WritesToConnections(t *testing.T) {
 	mockIPv4.EXPECT().WriteTo(mock.Anything, 1, mock.Anything).Return(0, nil).Once()
 	mockIPv6.EXPECT().WriteTo(mock.Anything, 1, mock.Anything).Return(0, nil).Once()
 
-	s := &Server{
-		ipv4conn:       mockIPv4,
-		ipv6conn:       mockIPv6,
-		ifaces:         []net.Interface{iface},
-		shouldShutdown: make(chan struct{}),
-		ttl:            3200,
-	}
+	s := testServer(mockIPv4, mockIPv6, []net.Interface{iface})
 
 	msg := new(dns.Msg)
 	msg.SetQuestion("_test._tcp.local.", dns.TypePTR)
@@ -126,13 +260,7 @@ func TestServer_MulticastResponse_SpecificInterface(t *testing.T) {
 	mockIPv4.EXPECT().WriteTo(mock.Anything, 2, mock.Anything).Return(0, nil).Once()
 	mockIPv6.EXPECT().WriteTo(mock.Anything, 2, mock.Anything).Return(0, nil).Once()
 
-	s := &Server{
-		ipv4conn:       mockIPv4,
-		ipv6conn:       mockIPv6,
-		ifaces:         []net.Interface{{Index: 1, Name: "eth0"}, {Index: 2, Name: "wlan0"}},
-		shouldShutdown: make(chan struct{}),
-		ttl:            3200,
-	}
+	s := testServer(mockIPv4, mockIPv6, []net.Interface{{Index: 1, Name: "eth0"}, {Index: 2, Name: "wlan0"}})
 
 	msg := new(dns.Msg)
 	msg.SetQuestion("_test._tcp.local.", dns.TypePTR)
@@ -155,18 +283,83 @@ func TestServer_Shutdown_ClosesConnections(t *testing.T) {
 	mockIPv4.EXPECT().Close().Return(nil).Once()
 	mockIPv6.EXPECT().Close().Return(nil).Once()
 
-	s := &Server{
-		ipv4conn:       mockIPv4,
-		ipv6conn:       mockIPv6,
-		ifaces:         []net.Interface{{Index: 1, Name: "eth0"}},
-		shouldShutdown: make(chan struct{}),
-		ttl:            3200,
-		service:        newServiceEntry("test", "_test._tcp", "local"),
-	}
+	s := testServer(mockIPv4, mockIPv6, []net.Interface{{Index: 1, Name: "eth0"}})
+	s.service = newServiceEntry("test", "_test._tcp", "local")
 	s.service.Port = 8080
 	s.service.HostName = "test.local."
 
 	s.Shutdown()
+}
+
+// TestServer_SyncInterfaces_JoinGroupSuccessActivates verifies syncInterfaces joins and activates.
+func TestServer_SyncInterfaces_JoinGroupSuccessActivates(t *testing.T) {
+	mockIPv4 := mocks.NewMockPacketConn(t)
+	mockProvider := mocks.NewMockInterfaceProvider(t)
+
+	iface := net.Interface{Index: 2, Name: "wlan0"}
+
+	mockProvider.EXPECT().MulticastInterfaces().Return([]net.Interface{iface}).Once()
+	mockIPv4.EXPECT().JoinGroup(mock.AnythingOfType("*net.Interface"), mock.Anything).RunAndReturn(
+		func(ifi *net.Interface, group net.Addr) error {
+			if ifi == nil || ifi.Index != iface.Index || ifi.Name != iface.Name {
+				t.Errorf("expected JoinGroup on %+v, got %+v", iface, ifi)
+			}
+			udpAddr, ok := group.(*net.UDPAddr)
+			if !ok || udpAddr == nil || !udpAddr.IP.Equal(mdnsGroupIPv4) {
+				t.Errorf("expected IPv4 group %v, got %v", mdnsGroupIPv4, group)
+			}
+			return nil
+		}).Once()
+
+	s := &Server{
+		ipv4conn:       mockIPv4,
+		ipv4Mgr:        NewInterfaceManager(nil, nil),
+		ipv6Mgr:        NewInterfaceManager(nil, nil),
+		provider:       mockProvider,
+		shouldShutdown: make(chan struct{}),
+		ttl:            3200,
+	}
+
+	s.syncInterfaces()
+
+	indices := s.ipv4Mgr.ActiveIndices()
+	if len(indices) != 1 || indices[0] != iface.Index {
+		t.Errorf("expected active indices [2], got %v", indices)
+	}
+}
+
+// TestServer_SyncInterfaces_JoinGroupFailureSetsBackoff verifies JoinGroup failure triggers backoff.
+func TestServer_SyncInterfaces_JoinGroupFailureSetsBackoff(t *testing.T) {
+	mockIPv6 := mocks.NewMockPacketConn(t)
+	mockProvider := mocks.NewMockInterfaceProvider(t)
+
+	iface := net.Interface{Index: 3, Name: "eth0"}
+
+	mockProvider.EXPECT().MulticastInterfaces().Return([]net.Interface{iface}).Once()
+	mockIPv6.EXPECT().JoinGroup(mock.AnythingOfType("*net.Interface"), mock.Anything).Return(syscall.ENETDOWN).Once()
+
+	s := &Server{
+		ipv6conn:       mockIPv6,
+		ipv4Mgr:        NewInterfaceManager(nil, nil),
+		ipv6Mgr:        NewInterfaceManager(nil, nil),
+		provider:       mockProvider,
+		shouldShutdown: make(chan struct{}),
+		ttl:            3200,
+	}
+
+	s.syncInterfaces()
+
+	indices := s.ipv6Mgr.ActiveIndices()
+	if len(indices) != 0 {
+		t.Errorf("expected no active indices after JoinGroup failure, got %v", indices)
+	}
+
+	s.ipv6Mgr.mu.RLock()
+	_, hasFailure := s.ipv6Mgr.failures[iface.Name]
+	s.ipv6Mgr.mu.RUnlock()
+	if !hasFailure {
+		t.Errorf("expected backoff failure state for %s", iface.Name)
+	}
 }
 
 // TestServerConfig verifies server configuration options
@@ -578,14 +771,8 @@ func TestServer_SetText(t *testing.T) {
 		}).Maybe()
 	mockIPv6.EXPECT().WriteTo(mock.Anything, mock.Anything, mock.Anything).Return(0, nil).Maybe()
 
-	s := &Server{
-		ipv4conn:       mockIPv4,
-		ipv6conn:       mockIPv6,
-		ifaces:         []net.Interface{{Index: 1, Name: "eth0"}},
-		shouldShutdown: make(chan struct{}),
-		ttl:            3200,
-		service:        newServiceEntry("test", "_test._tcp", "local"),
-	}
+	s := testServer(mockIPv4, mockIPv6, []net.Interface{{Index: 1, Name: "eth0"}})
+	s.service = newServiceEntry("test", "_test._tcp", "local")
 	s.service.Port = 8080
 	s.service.HostName = "test.local."
 	s.service.Text = []string{"old=value"}
@@ -626,14 +813,8 @@ func TestServer_HandleQuery_RespondsToQueries(t *testing.T) {
 		}).Maybe()
 	mockIPv6.EXPECT().WriteTo(mock.Anything, mock.Anything, mock.Anything).Return(0, nil).Maybe()
 
-	s := &Server{
-		ipv4conn:       mockIPv4,
-		ipv6conn:       mockIPv6,
-		ifaces:         []net.Interface{{Index: 1, Name: "eth0"}},
-		shouldShutdown: make(chan struct{}),
-		ttl:            3200,
-		service:        newServiceEntry("myservice", "_http._tcp", "local"),
-	}
+	s := testServer(mockIPv4, mockIPv6, []net.Interface{{Index: 1, Name: "eth0"}})
+	s.service = newServiceEntry("myservice", "_http._tcp", "local")
 	s.service.Port = 8080
 	s.service.HostName = "myhost.local."
 	s.service.Text = []string{"key=value"}
@@ -691,14 +872,8 @@ func TestServer_UnicastResponse(t *testing.T) {
 			return len(b), nil
 		}).Once()
 
-	s := &Server{
-		ipv4conn:       mockIPv4,
-		ipv6conn:       nil,
-		ifaces:         []net.Interface{{Index: 1, Name: "eth0"}},
-		shouldShutdown: make(chan struct{}),
-		ttl:            3200,
-		service:        newServiceEntry("myservice", "_http._tcp", "local"),
-	}
+	s := testServer(mockIPv4, nil, []net.Interface{{Index: 1, Name: "eth0"}})
+	s.service = newServiceEntry("myservice", "_http._tcp", "local")
 	s.service.Port = 8080
 	s.service.HostName = "myhost.local."
 
@@ -724,5 +899,110 @@ func TestServer_UnicastResponse(t *testing.T) {
 		} else if !udpAddr.IP.Equal(net.ParseIP("192.168.1.50")) {
 			t.Errorf("Expected response to 192.168.1.50, got %s", udpAddr.IP)
 		}
+	}
+}
+
+// helper function to extract interface names from a slice of net.Interface for easy lookup in tests
+func ifaceNames(ifaces []net.Interface) map[string]bool {
+	m := make(map[string]bool, len(ifaces))
+	for _, iface := range ifaces {
+		m[iface.Name] = true
+	}
+	return m
+}
+
+func TestMergeInterfaces_BothEmpty(t *testing.T) {
+	result := mergeInterfaces(nil, nil)
+	if len(result) != 0 {
+		t.Fatalf("expected empty result, got %d", len(result))
+	}
+}
+
+func TestMergeInterfaces_IPv4EmptyIPv6NotEmpty(t *testing.T) {
+	ipv6 := []net.Interface{
+		{Index: 1, Name: "eth0"},
+		{Index: 2, Name: "eth1"},
+	}
+	result := mergeInterfaces(nil, ipv6)
+	if len(result) != 2 {
+		t.Fatalf("expected 2 interfaces, got %d", len(result))
+	}
+	names := ifaceNames(result)
+	if !names["eth0"] || !names["eth1"] {
+		t.Fatalf("expected eth0 and eth1, got %v", names)
+	}
+}
+
+func TestMergeInterfaces_IPv6EmptyIPv4NotEmpty(t *testing.T) {
+	ipv4 := []net.Interface{
+		{Index: 1, Name: "eth0"},
+		{Index: 2, Name: "eth1"},
+	}
+	result := mergeInterfaces(ipv4, nil)
+	if len(result) != 2 {
+		t.Fatalf("expected 2 interfaces, got %d", len(result))
+	}
+	names := ifaceNames(result)
+	if !names["eth0"] || !names["eth1"] {
+		t.Fatalf("expected eth0 and eth1, got %v", names)
+	}
+}
+
+func TestMergeInterfaces_NoOverlap(t *testing.T) {
+	ipv4 := []net.Interface{
+		{Index: 5, Name: "eth1"},
+		{Index: 10, Name: "eth2"},
+	}
+	ipv6 := []net.Interface{
+		{Index: 1, Name: "lo"},
+		{Index: 3, Name: "wlan0"},
+	}
+	result := mergeInterfaces(ipv4, ipv6)
+	if len(result) != 4 {
+		t.Fatalf("expected 4 interfaces, got %d", len(result))
+	}
+	names := ifaceNames(result)
+	for _, expected := range []string{"lo", "wlan0", "eth1", "eth2"} {
+		if !names[expected] {
+			t.Fatalf("expected %s in result, got %v", expected, names)
+		}
+	}
+}
+
+func TestMergeInterfaces_PartialOverlap(t *testing.T) {
+	ipv4 := []net.Interface{
+		{Index: 1, Name: "eth0"},
+		{Index: 2, Name: "eth1"},
+	}
+	ipv6 := []net.Interface{
+		{Index: 2, Name: "eth1"},
+		{Index: 3, Name: "wlan0"},
+	}
+	result := mergeInterfaces(ipv4, ipv6)
+	if len(result) != 3 {
+		t.Fatalf("expected 3 interfaces, got %d", len(result))
+	}
+	names := ifaceNames(result)
+	if !names["eth0"] || !names["eth1"] || !names["wlan0"] {
+		t.Fatalf("expected eth0, eth1, wlan0, got %v", names)
+	}
+}
+
+func TestMergeInterfaces_FullOverlap(t *testing.T) {
+	ipv4 := []net.Interface{
+		{Index: 1, Name: "eth0"},
+		{Index: 2, Name: "wlan0"},
+	}
+	ipv6 := []net.Interface{
+		{Index: 1, Name: "eth0"},
+		{Index: 2, Name: "wlan0"},
+	}
+	result := mergeInterfaces(ipv4, ipv6)
+	if len(result) != 2 {
+		t.Fatalf("expected 2 interfaces, got %d", len(result))
+	}
+	names := ifaceNames(result)
+	if !names["eth0"] || !names["wlan0"] {
+		t.Fatalf("expected eth0 and wlan0, got %v", names)
 	}
 }
