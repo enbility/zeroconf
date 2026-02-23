@@ -6,14 +6,12 @@ import (
 	"math/rand"
 	"net"
 	"os"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/enbility/zeroconf/v3/api"
 	"github.com/miekg/dns"
-	"golang.org/x/net/ipv4"
-	"golang.org/x/net/ipv6"
 )
 
 const (
@@ -24,7 +22,8 @@ const (
 var defaultTTL uint32 = 3200
 
 type serverOpts struct {
-	ttl uint32
+	ttl         uint32
+	connFactory api.ConnectionFactory
 }
 
 func applyServerOpts(options ...ServerOption) serverOpts {
@@ -47,6 +46,14 @@ type ServerOption func(*serverOpts)
 func TTL(ttl uint32) ServerOption {
 	return func(o *serverOpts) {
 		o.ttl = ttl
+	}
+}
+
+// WithServerConnFactory sets a custom connection factory for the server.
+// This is primarily useful for testing with mock connections.
+func WithServerConnFactory(factory api.ConnectionFactory) ServerOption {
+	return func(o *serverOpts) {
+		o.connFactory = factory
 	}
 }
 
@@ -83,7 +90,7 @@ func Register(instance, service, domain string, port int, text []string, ifaces 
 	}
 
 	if len(ifaces) == 0 {
-		ifaces = listMulticastInterfaces()
+		ifaces = NewInterfaceProvider().MulticastInterfaces()
 	}
 
 	for _, iface := range ifaces {
@@ -149,7 +156,7 @@ func RegisterProxy(instance, service, domain string, port int, host string, ips 
 	}
 
 	if len(ifaces) == 0 {
-		ifaces = listMulticastInterfaces()
+		ifaces = NewInterfaceProvider().MulticastInterfaces()
 	}
 
 	s, err := newServer(ifaces, applyServerOpts(opts...))
@@ -170,8 +177,8 @@ const (
 // Server structure encapsulates both IPv4/IPv6 UDP connections
 type Server struct {
 	service  *ServiceEntry
-	ipv4conn *ipv4.PacketConn
-	ipv6conn *ipv6.PacketConn
+	ipv4conn api.PacketConn
+	ipv6conn api.PacketConn
 	ifaces   []net.Interface
 
 	shouldShutdown chan struct{}
@@ -183,11 +190,16 @@ type Server struct {
 
 // Constructs server structure
 func newServer(ifaces []net.Interface, opts serverOpts) (*Server, error) {
-	ipv4conn, err4 := joinUdp4Multicast(ifaces)
+	factory := opts.connFactory
+	if factory == nil {
+		factory = NewConnectionFactory()
+	}
+
+	ipv4conn, err4 := factory.CreateIPv4Conn(ifaces)
 	if err4 != nil {
 		log.Printf("[zeroconf] no suitable IPv4 interface: %s", err4.Error())
 	}
-	ipv6conn, err6 := joinUdp6Multicast(ifaces)
+	ipv6conn, err6 := factory.CreateIPv6Conn(ifaces)
 	if err6 != nil {
 		log.Printf("[zeroconf] no suitable IPv6 interface: %s", err6.Error())
 	}
@@ -210,11 +222,11 @@ func newServer(ifaces []net.Interface, opts serverOpts) (*Server, error) {
 func (s *Server) start() {
 	if s.ipv4conn != nil {
 		s.refCount.Add(1)
-		go s.recv4(s.ipv4conn)
+		go s.recvLoop(s.ipv4conn)
 	}
 	if s.ipv6conn != nil {
 		s.refCount.Add(1)
-		go s.recv6(s.ipv6conn)
+		go s.recvLoop(s.ipv6conn)
 	}
 	s.refCount.Add(1)
 	go s.probe()
@@ -224,13 +236,6 @@ func (s *Server) start() {
 func (s *Server) SetText(text []string) {
 	s.service.Text = text
 	s.announceText()
-}
-
-// TTL sets the TTL for DNS replies
-//
-// Deprecated: This method is racy. Use the TTL server option instead.
-func (s *Server) TTL(ttl uint32) {
-	s.ttl = ttl
 }
 
 // Shutdown closes all udp connections and unregisters the service
@@ -259,8 +264,9 @@ func (s *Server) Shutdown() {
 	s.isShutdown = true
 }
 
-// recv4 is a long running routine to receive packets from an interface
-func (s *Server) recv4(c *ipv4.PacketConn) {
+// recvLoop is a long running routine to receive packets from a connection.
+// It uses the PacketConn interface, allowing for mock injection in tests.
+func (s *Server) recvLoop(c api.PacketConn) {
 	defer s.refCount.Done()
 	if c == nil {
 		return
@@ -271,38 +277,15 @@ func (s *Server) recv4(c *ipv4.PacketConn) {
 		case <-s.shouldShutdown:
 			return
 		default:
-			var ifIndex int
-			n, cm, from, err := c.ReadFrom(buf)
+			n, ifIndex, from, err := c.ReadFrom(buf)
 			if err != nil {
-				continue
-			}
-			if cm != nil {
-				ifIndex = cm.IfIndex
-			}
-			_ = s.parsePacket(buf[:n], ifIndex, from)
-		}
-	}
-}
-
-// recv6 is a long running routine to receive packets from an interface
-func (s *Server) recv6(c *ipv6.PacketConn) {
-	defer s.refCount.Done()
-	if c == nil {
-		return
-	}
-	buf := make([]byte, 65536)
-	for {
-		select {
-		case <-s.shouldShutdown:
-			return
-		default:
-			var ifIndex int
-			n, cm, from, err := c.ReadFrom(buf)
-			if err != nil {
-				continue
-			}
-			if cm != nil {
-				ifIndex = cm.IfIndex
+				// Backoff to prevent CPU spin on persistent errors
+				select {
+				case <-s.shouldShutdown:
+					return
+				case <-time.After(50 * time.Millisecond):
+					continue
+				}
 			}
 			_ = s.parsePacket(buf[:n], ifIndex, from)
 		}
@@ -738,24 +721,11 @@ func (s *Server) unicastResponse(resp *dns.Msg, ifIndex int, from net.Addr) erro
 	}
 	addr := from.(*net.UDPAddr)
 	if addr.IP.To4() != nil {
-		if ifIndex != 0 {
-			var wcm ipv4.ControlMessage
-			wcm.IfIndex = ifIndex
-			_, err = s.ipv4conn.WriteTo(buf, &wcm, addr)
-		} else {
-			_, err = s.ipv4conn.WriteTo(buf, nil, addr)
-		}
-		return err
-	} else {
-		if ifIndex != 0 {
-			var wcm ipv6.ControlMessage
-			wcm.IfIndex = ifIndex
-			_, err = s.ipv6conn.WriteTo(buf, &wcm, addr)
-		} else {
-			_, err = s.ipv6conn.WriteTo(buf, nil, addr)
-		}
+		_, err = s.ipv4conn.WriteTo(buf, ifIndex, addr)
 		return err
 	}
+	_, err = s.ipv6conn.WriteTo(buf, ifIndex, addr)
+	return err
 }
 
 // multicastResponse is used to send a multicast response packet
@@ -764,67 +734,31 @@ func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int) error {
 	if err != nil {
 		return fmt.Errorf("failed to pack msg %v: %w", msg, err)
 	}
-	if s.ipv4conn != nil {
-		// See https://pkg.go.dev/golang.org/x/net/ipv4#pkg-note-BUG
-		// As of Golang 1.18.4
-		// On Windows, the ControlMessage for ReadFrom and WriteTo methods of PacketConn is not implemented.
-		var wcm ipv4.ControlMessage
-		if ifIndex != 0 {
-			switch runtime.GOOS {
-			case "darwin", "ios", "linux":
-				wcm.IfIndex = ifIndex
-			default:
-				iface, _ := net.InterfaceByIndex(ifIndex)
-				if err := s.ipv4conn.SetMulticastInterface(iface); err != nil {
-					log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
-				}
-			}
-			_, _ = s.ipv4conn.WriteTo(buf, &wcm, ipv4Addr)
-		} else {
-			for _, intf := range s.ifaces {
-				switch runtime.GOOS {
-				case "darwin", "ios", "linux":
-					wcm.IfIndex = intf.Index
-				default:
-					if err := s.ipv4conn.SetMulticastInterface(&intf); err != nil {
-						log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
-					}
-				}
-				_, _ = s.ipv4conn.WriteTo(buf, &wcm, ipv4Addr)
-			}
+
+	// Determine which interfaces to send to
+	var ifaces []int
+	if ifIndex != 0 {
+		ifaces = []int{ifIndex}
+	} else {
+		for _, intf := range s.ifaces {
+			ifaces = append(ifaces, intf.Index)
 		}
 	}
 
-	if s.ipv6conn != nil {
-		// See https://pkg.go.dev/golang.org/x/net/ipv6#pkg-note-BUG
-		// As of Golang 1.18.4
-		// On Windows, the ControlMessage for ReadFrom and WriteTo methods of PacketConn is not implemented.
-		var wcm ipv6.ControlMessage
-		if ifIndex != 0 {
-			switch runtime.GOOS {
-			case "darwin", "ios", "linux":
-				wcm.IfIndex = ifIndex
-			default:
-				iface, _ := net.InterfaceByIndex(ifIndex)
-				if err := s.ipv6conn.SetMulticastInterface(iface); err != nil {
-					log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
-				}
-			}
-			_, _ = s.ipv6conn.WriteTo(buf, &wcm, ipv6Addr)
-		} else {
-			for _, intf := range s.ifaces {
-				switch runtime.GOOS {
-				case "darwin", "ios", "linux":
-					wcm.IfIndex = intf.Index
-				default:
-					if err := s.ipv6conn.SetMulticastInterface(&intf); err != nil {
-						log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
-					}
-				}
-				_, _ = s.ipv6conn.WriteTo(buf, &wcm, ipv6Addr)
-			}
+	// Send to IPv4 multicast group
+	if s.ipv4conn != nil {
+		for _, idx := range ifaces {
+			_, _ = s.ipv4conn.WriteTo(buf, idx, ipv4Addr)
 		}
 	}
+
+	// Send to IPv6 multicast group
+	if s.ipv6conn != nil {
+		for _, idx := range ifaces {
+			_, _ = s.ipv6conn.WriteTo(buf, idx, ipv6Addr)
+		}
+	}
+
 	return nil
 }
 
