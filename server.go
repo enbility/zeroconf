@@ -85,10 +85,7 @@ func Register(instance, service, domain string, port int, text []string, ifaces 
 	if entry.Port == 0 {
 		return nil, fmt.Errorf("missing port")
 	}
-
-	// Ensure domain has trailing dot
-	entry.Domain = fmt.Sprintf("%s.", trimDot(entry.Domain))
-
+	
 	var err error
 	if entry.HostName == "" {
 		entry.HostName, err = os.Hostname()
@@ -97,7 +94,15 @@ func Register(instance, service, domain string, port int, text []string, ifaces 
 		}
 	}
 
-	if !strings.HasSuffix(trimDot(entry.HostName), entry.Domain) {
+	// On MacOS os.Hostname() returns the hostname with the domain at the end but without trailing "."
+	// e.g. "MacBook-Air.local" in this case we simply add a dot to get a fully qualified mdns domain 
+	if strings.HasSuffix(entry.HostName, trimDot(entry.Domain)) {
+		entry.HostName += "."
+	}
+
+	// Ensure domain has trailing dot
+	entry.Domain = fmt.Sprintf("%s.", trimDot(entry.Domain))
+	if !strings.HasSuffix(entry.HostName, entry.Domain) {
 		entry.HostName = fmt.Sprintf("%s.%s.", trimDot(entry.HostName), trimDot(entry.Domain))
 	}
 
@@ -150,10 +155,15 @@ func RegisterProxy(instance, service, domain string, port int, host string, ips 
 		return nil, fmt.Errorf("missing port")
 	}
 
+	// On MacOS os.Hostname() returns the hostname with the domain at the end but without trailing "."
+	// e.g. "MacBook-Air.local" in this case we simply add a dot to get a fully qualified mdns domain 
+	if strings.HasSuffix(entry.HostName, trimDot(entry.Domain)) {
+		entry.HostName += "."
+	}
+
 	// Ensure domain has trailing dot
 	entry.Domain = fmt.Sprintf("%s.", trimDot(entry.Domain))
-
-	if !strings.HasSuffix(trimDot(entry.HostName), entry.Domain) {
+	if !strings.HasSuffix(entry.HostName, entry.Domain) {
 		entry.HostName = fmt.Sprintf("%s.%s.", trimDot(entry.HostName), trimDot(entry.Domain))
 	}
 

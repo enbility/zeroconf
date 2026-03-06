@@ -2,7 +2,10 @@ package zeroconf
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -199,6 +202,153 @@ func TestSubtype(t *testing.T) {
 		res2 := <-entries
 		if res1.ServiceInstanceName() != res2.ServiceInstanceName() {
 			t.Fatalf("expected the two entries to be identical")
+		}
+	})
+}
+
+func TestFullyQualifiedDomain(t *testing.T) {
+	discoverEntry := func(t *testing.T, instance, service, domain string) *ServiceEntry {
+		t.Helper()
+
+		time.Sleep(time.Second)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		entries := make(chan *ServiceEntry, 100)
+		expired := make(chan *ServiceEntry, 100)
+		if err := Browse(ctx, service, fmt.Sprintf("%s.", trimDot(domain)), entries, expired); err != nil {
+			t.Fatalf("Expected browse success, but got %v", err)
+		}
+		<-ctx.Done()
+
+		if len(entries) == 0 {
+			t.Fatal("Expected at least one service entry, but got none")
+		}
+
+		for len(entries) > 0 {
+			result := <-entries
+			if result.Instance == instance {
+				return result
+			}
+		}
+
+		t.Fatalf("Expected service entry for instance %q, but did not find it", instance)
+		return nil
+	}
+
+	expectedHostName := func(hostName, domain string) string {
+		t.Helper()
+
+		if strings.HasSuffix(hostName, trimDot(domain)) {
+			hostName += "."
+		}
+
+		domain = fmt.Sprintf("%s.", trimDot(domain))
+		if !strings.HasSuffix(hostName, domain) {
+			hostName = fmt.Sprintf("%s.%s.", trimDot(hostName), trimDot(domain))
+		}
+
+		return hostName
+	}
+
+	t.Run("Register", func(t *testing.T) {
+		testCases := []struct {
+			name   string
+			domain string
+		}{
+			{name: "domain without trailing dot", domain: "local"},
+			{name: "domain with trailing dot", domain: "local."},
+		}
+
+		for i, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				hostName, err := os.Hostname()
+				if err != nil {
+					t.Fatalf("could not determine host: %v", err)
+				}
+
+				instance := fmt.Sprintf("test-register-fqdn-%d", i)
+				service := fmt.Sprintf("_fqdn-register-%d._tcp", i)
+
+				server, err := Register(instance, service, tc.domain, mdnsPort, []string{"txtv=0"}, nil)
+				if err != nil {
+					t.Fatalf("error while registering mdns service: %s", err)
+				}
+				t.Cleanup(server.Shutdown)
+
+				result := discoverEntry(t, instance, service, tc.domain)
+				if result.Domain != "local." {
+					t.Fatalf("Expected domain is local., but got %s", result.Domain)
+				}
+				if result.HostName != expectedHostName(hostName, tc.domain) {
+					t.Fatalf("Expected hostname is %s, but got %s", expectedHostName(hostName, tc.domain), result.HostName)
+				}
+			})
+		}
+	})
+
+	t.Run("RegisterProxy", func(t *testing.T) {
+		testCases := []struct {
+			name         string
+			hostName     string
+			domain       string
+			expectedHost string
+		}{
+			{
+				name:         "short hostname without trailing dot in domain",
+				hostName:     "Laptop-1",
+				domain:       "local",
+				expectedHost: "Laptop-1.local.",
+			},
+			{
+				name:         "short hostname with trailing dot in domain",
+				hostName:     "Laptop-1",
+				domain:       "local.",
+				expectedHost: "Laptop-1.local.",
+			},
+			{
+				name:         "hostname including domain without trailing dot in domain",
+				hostName:     "MacBook-Air.local",
+				domain:       "local",
+				expectedHost: "MacBook-Air.local.",
+			},
+			{
+				name:         "hostname including domain with trailing dot in domain",
+				hostName:     "MacBook-Air.local",
+				domain:       "local.",
+				expectedHost: "MacBook-Air.local.",
+			},
+		}
+
+		for i, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				instance := fmt.Sprintf("test-registerproxy-fqdn-%d", i)
+				service := fmt.Sprintf("_fqdn-registerproxy-%d._tcp", i)
+
+				server, err := RegisterProxy(
+					instance,
+					service,
+					tc.domain,
+					mdnsPort,
+					tc.hostName,
+					[]string{"192.168.1.100"},
+					[]string{"txtv=0"},
+					nil,
+				)
+				if err != nil {
+					t.Fatalf("error while registering proxy mdns service: %s", err)
+				}
+				t.Cleanup(server.Shutdown)
+
+				result := discoverEntry(t, instance, service, tc.domain)
+				if result.Domain != "local." {
+					t.Fatalf("Expected domain is local., but got %s", result.Domain)
+				}
+				if result.HostName != tc.expectedHost {
+					t.Fatalf("Expected hostname is %s, but got %s", tc.expectedHost, result.HostName)
+				}
+			})
 		}
 	})
 }
