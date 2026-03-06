@@ -21,6 +21,8 @@ const (
 
 var defaultTTL uint32 = 3200
 
+var hostnameFunc = os.Hostname
+
 type serverOpts struct {
 	ttl         uint32
 	connFactory api.ConnectionFactory
@@ -85,17 +87,17 @@ func Register(instance, service, domain string, port int, text []string, ifaces 
 	if entry.Port == 0 {
 		return nil, fmt.Errorf("missing port")
 	}
-	
+
 	var err error
 	if entry.HostName == "" {
-		entry.HostName, err = os.Hostname()
+		entry.HostName, err = hostnameFunc()
 		if err != nil {
 			return nil, fmt.Errorf("could not determine host")
 		}
 	}
 
 	// On MacOS os.Hostname() returns the hostname with the domain at the end but without trailing "."
-	// e.g. "MacBook-Air.local" in this case we simply add a dot to get a fully qualified mdns domain 
+	// e.g. "MacBook-Air.local" in this case we simply add a dot to get a fully qualified mdns domain
 	if strings.HasSuffix(entry.HostName, trimDot(entry.Domain)) {
 		entry.HostName += "."
 	}
@@ -156,7 +158,7 @@ func RegisterProxy(instance, service, domain string, port int, host string, ips 
 	}
 
 	// On MacOS os.Hostname() returns the hostname with the domain at the end but without trailing "."
-	// e.g. "MacBook-Air.local" in this case we simply add a dot to get a fully qualified mdns domain 
+	// e.g. "MacBook-Air.local" in this case we simply add a dot to get a fully qualified mdns domain
 	if strings.HasSuffix(entry.HostName, trimDot(entry.Domain)) {
 		entry.HostName += "."
 	}

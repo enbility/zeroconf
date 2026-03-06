@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"os"
-	"strings"
 	"testing"
 	"time"
 )
@@ -237,36 +235,48 @@ func TestFullyQualifiedDomain(t *testing.T) {
 		return nil
 	}
 
-	expectedHostName := func(hostName, domain string) string {
-		t.Helper()
-
-		if strings.HasSuffix(hostName, trimDot(domain)) {
-			hostName += "."
-		}
-
-		domain = fmt.Sprintf("%s.", trimDot(domain))
-		if !strings.HasSuffix(hostName, domain) {
-			hostName = fmt.Sprintf("%s.%s.", trimDot(hostName), trimDot(domain))
-		}
-
-		return hostName
-	}
-
 	t.Run("Register", func(t *testing.T) {
 		testCases := []struct {
-			name   string
-			domain string
+			name         string
+			hostName     string
+			domain       string
+			expectedHost string
 		}{
-			{name: "domain without trailing dot", domain: "local"},
-			{name: "domain with trailing dot", domain: "local."},
+			{
+				name:         "short hostname without trailing dot in domain",
+				hostName:     "Laptop-1",
+				domain:       "local",
+				expectedHost: "Laptop-1.local.",
+			},
+			{
+				name:         "short hostname with trailing dot in domain",
+				hostName:     "Laptop-1",
+				domain:       "local.",
+				expectedHost: "Laptop-1.local.",
+			},
+			{
+				name:         "hostname including domain without trailing dot in domain",
+				hostName:     "MacBook-Air.local",
+				domain:       "local",
+				expectedHost: "MacBook-Air.local.",
+			},
+			{
+				name:         "hostname including domain with trailing dot in domain",
+				hostName:     "MacBook-Air.local",
+				domain:       "local.",
+				expectedHost: "MacBook-Air.local.",
+			},
 		}
 
 		for i, tc := range testCases {
 			t.Run(tc.name, func(t *testing.T) {
-				hostName, err := os.Hostname()
-				if err != nil {
-					t.Fatalf("could not determine host: %v", err)
+				origHostnameFunc := hostnameFunc
+				hostnameFunc = func() (string, error) {
+					return tc.hostName, nil
 				}
+				t.Cleanup(func() {
+					hostnameFunc = origHostnameFunc
+				})
 
 				instance := fmt.Sprintf("test-register-fqdn-%d", i)
 				service := fmt.Sprintf("_fqdn-register-%d._tcp", i)
@@ -281,8 +291,8 @@ func TestFullyQualifiedDomain(t *testing.T) {
 				if result.Domain != "local." {
 					t.Fatalf("Expected domain is local., but got %s", result.Domain)
 				}
-				if result.HostName != expectedHostName(hostName, tc.domain) {
-					t.Fatalf("Expected hostname is %s, but got %s", expectedHostName(hostName, tc.domain), result.HostName)
+				if result.HostName != tc.expectedHost {
+					t.Fatalf("Expected hostname is %s, but got %s", tc.expectedHost, result.HostName)
 				}
 			})
 		}
