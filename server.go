@@ -86,6 +86,9 @@ func Register(instance, service, domain string, port int, text []string, ifaces 
 		return nil, fmt.Errorf("missing port")
 	}
 
+	// Ensure domain has trailing dot
+	entry.Domain = fmt.Sprintf("%s.", trimDot(entry.Domain))
+
 	var err error
 	if entry.HostName == "" {
 		entry.HostName, err = os.Hostname()
@@ -146,6 +149,9 @@ func RegisterProxy(instance, service, domain string, port int, host string, ips 
 	if entry.Port == 0 {
 		return nil, fmt.Errorf("missing port")
 	}
+
+	// Ensure domain has trailing dot
+	entry.Domain = fmt.Sprintf("%s.", trimDot(entry.Domain))
 
 	if !strings.HasSuffix(trimDot(entry.HostName), entry.Domain) {
 		entry.HostName = fmt.Sprintf("%s.%s.", trimDot(entry.HostName), trimDot(entry.Domain))
