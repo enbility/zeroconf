@@ -291,10 +291,16 @@ func (s *Server) Shutdown() {
 	close(s.shouldShutdown)
 
 	if s.ipv4conn != nil {
-		s.ipv4conn.Close()
+		err := s.ipv4conn.Close()
+		if err != nil {
+			log.Printf("Was unable to cleanly close server IPv4 connection: %s", err.Error())
+		}
 	}
 	if s.ipv6conn != nil {
-		s.ipv6conn.Close()
+		err := s.ipv6conn.Close()
+		if err != nil {
+			log.Printf("Was unable to cleanly close server IPv6 connection: %s", err.Error())
+		}
 	}
 
 	// Wait for connection and routines to be closed
@@ -637,7 +643,7 @@ func (s *Server) probe() {
 		activeIfaces := mergeInterfaces(ipv4ActiveIfaces, ipv6ActiveIfaces)
 		for _, intf := range activeIfaces {
 			resp := new(dns.Msg)
-			resp.MsgHdr.Response = true
+			resp.Response = true
 			// TODO: make response authoritative if we are the publisher
 			resp.Compress = true
 			resp.Answer = []dns.RR{}
@@ -660,7 +666,7 @@ func (s *Server) probe() {
 // announceText sends a Text announcement with cache flush enabled
 func (s *Server) announceText() {
 	resp := new(dns.Msg)
-	resp.MsgHdr.Response = true
+	resp.Response = true
 
 	txt := &dns.TXT{
 		Hdr: dns.RR_Header{
@@ -678,7 +684,7 @@ func (s *Server) announceText() {
 
 func (s *Server) unregister() error {
 	resp := new(dns.Msg)
-	resp.MsgHdr.Response = true
+	resp.Response = true
 	resp.Answer = []dns.RR{}
 	resp.Extra = []dns.RR{}
 	s.composeLookupAnswers(resp, 0, 0, true)

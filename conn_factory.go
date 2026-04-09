@@ -37,7 +37,7 @@ func (f *defaultConnectionFactory) CreateIPv4Conn(ifaces []net.Interface) (api.P
 		}
 	}
 	if failedJoins == len(ifaces) {
-		pkConn.Close()
+		_ = pkConn.Close()
 		return nil, fmt.Errorf("udp4: failed to join any of these interfaces: %v", ifaces)
 	}
 
@@ -62,7 +62,7 @@ func (f *defaultConnectionFactory) CreateIPv6Conn(ifaces []net.Interface) (api.P
 		}
 	}
 	if failedJoins == len(ifaces) {
-		pkConn.Close()
+		_ = pkConn.Close()
 		return nil, fmt.Errorf("udp6: failed to join any of these interfaces: %v", ifaces)
 	}
 
