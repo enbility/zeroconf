@@ -293,13 +293,13 @@ func (s *Server) Shutdown() {
 	if s.ipv4conn != nil {
 		err := s.ipv4conn.Close()
 		if err != nil {
-			log.Printf("Was unable to cleanly close server IPv4 connection: %s", err.Error())
+			log.Printf("[zeroconf] unable to cleanly close server IPv4 connection: %s", err.Error())
 		}
 	}
 	if s.ipv6conn != nil {
 		err := s.ipv6conn.Close()
 		if err != nil {
-			log.Printf("Was unable to cleanly close server IPv6 connection: %s", err.Error())
+			log.Printf("[zeroconf] unable to cleanly close server IPv6 connection: %s", err.Error())
 		}
 	}
 

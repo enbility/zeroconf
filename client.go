@@ -393,13 +393,13 @@ func (c *Client) shutdown() {
 	if c.ipv4conn != nil {
 		err := c.ipv4conn.Close()
 		if err != nil {
-			log.Printf("Was unable to cleanly close client IPv4 connection: %s", err.Error())
+			log.Printf("[zeroconf] unable to cleanly close client IPv4 connection: %s", err.Error())
 		}
 	}
 	if c.ipv6conn != nil {
 		err := c.ipv6conn.Close()
 		if err != nil {
-			log.Printf("Was unable to cleanly close client IPv6 connection: %s", err.Error())
+			log.Printf("[zeroconf] unable to cleanly close client IPv6 connection: %s", err.Error())
 		}
 	}
 }
