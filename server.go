@@ -21,6 +21,8 @@ const (
 
 var defaultTTL uint32 = 3200
 
+var hostnameFunc = os.Hostname
+
 type serverOpts struct {
 	ttl         uint32
 	connFactory api.ConnectionFactory
@@ -88,13 +90,21 @@ func Register(instance, service, domain string, port int, text []string, ifaces 
 
 	var err error
 	if entry.HostName == "" {
-		entry.HostName, err = os.Hostname()
+		entry.HostName, err = hostnameFunc()
 		if err != nil {
 			return nil, fmt.Errorf("could not determine host")
 		}
 	}
 
-	if !strings.HasSuffix(trimDot(entry.HostName), entry.Domain) {
+	// On MacOS os.Hostname() returns the hostname with the domain at the end but without trailing "."
+	// e.g. "MacBook-Air.local" in this case we simply add a dot to get a fully qualified mdns domain
+	if strings.HasSuffix(entry.HostName, trimDot(entry.Domain)) {
+		entry.HostName += "."
+	}
+
+	// Ensure domain has trailing dot
+	entry.Domain = fmt.Sprintf("%s.", trimDot(entry.Domain))
+	if !strings.HasSuffix(entry.HostName, entry.Domain) {
 		entry.HostName = fmt.Sprintf("%s.%s.", trimDot(entry.HostName), trimDot(entry.Domain))
 	}
 
@@ -147,7 +157,15 @@ func RegisterProxy(instance, service, domain string, port int, host string, ips 
 		return nil, fmt.Errorf("missing port")
 	}
 
-	if !strings.HasSuffix(trimDot(entry.HostName), entry.Domain) {
+	// On MacOS os.Hostname() returns the hostname with the domain at the end but without trailing "."
+	// e.g. "MacBook-Air.local" in this case we simply add a dot to get a fully qualified mdns domain
+	if strings.HasSuffix(entry.HostName, trimDot(entry.Domain)) {
+		entry.HostName += "."
+	}
+
+	// Ensure domain has trailing dot
+	entry.Domain = fmt.Sprintf("%s.", trimDot(entry.Domain))
+	if !strings.HasSuffix(entry.HostName, entry.Domain) {
 		entry.HostName = fmt.Sprintf("%s.%s.", trimDot(entry.HostName), trimDot(entry.Domain))
 	}
 
