@@ -287,7 +287,7 @@ func (c *Client) mainloop(ctx context.Context, params *lookupParams) {
 					}
 					if _, ok := entries[rr.Ptr]; !ok {
 						entries[rr.Ptr] = newServiceEntry(
-							trimDot(strings.Replace(rr.Ptr, rr.Hdr.Name, "", -1)),
+							trimDot(strings.ReplaceAll(rr.Ptr, rr.Hdr.Name, "")),
 							params.Service,
 							params.Domain)
 					}
@@ -368,7 +368,7 @@ func (c *Client) mainloop(ctx context.Context, params *lookupParams) {
 
 				// If this is an DNS-SD query do not throw PTR away.
 				// It is expected to have only PTR for enumeration
-				if params.ServiceRecord.ServiceTypeName() != params.ServiceRecord.ServiceName() {
+				if params.ServiceTypeName() != params.ServiceName() {
 					// Require at least one resolved IP address for ServiceEntry
 					// TODO: wait some more time as chances are high both will arrive.
 					if len(e.AddrIPv4) == 0 && len(e.AddrIPv6) == 0 {
@@ -391,10 +391,16 @@ func (c *Client) mainloop(ctx context.Context, params *lookupParams) {
 // Shutdown client will close currently open connections and channel implicitly.
 func (c *Client) shutdown() {
 	if c.ipv4conn != nil {
-		c.ipv4conn.Close()
+		err := c.ipv4conn.Close()
+		if err != nil {
+			log.Printf("[zeroconf] unable to cleanly close client IPv4 connection: %s", err.Error())
+		}
 	}
 	if c.ipv6conn != nil {
-		c.ipv6conn.Close()
+		err := c.ipv6conn.Close()
+		if err != nil {
+			log.Printf("[zeroconf] unable to cleanly close client IPv6 connection: %s", err.Error())
+		}
 	}
 }
 

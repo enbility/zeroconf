@@ -18,14 +18,6 @@ func mockInterface(index int, name string) net.Interface {
 	}
 }
 
-func mockInterfaces(specs ...struct{ idx int; name string }) []net.Interface {
-	result := make([]net.Interface, len(specs))
-	for i, s := range specs {
-		result[i] = mockInterface(s.idx, s.name)
-	}
-	return result
-}
-
 // ============================================================================
 // NewInterfaceManager Tests
 // ============================================================================
