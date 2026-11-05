@@ -3,6 +3,8 @@ package zeroconf
 import (
 	"errors"
 	"fmt"
+	"net"
+	"os"
 	"syscall"
 	"testing"
 )
@@ -127,5 +129,13 @@ func TestIsInterfaceGone_FallbackMessageParsing_CaseInsensitive(t *testing.T) {
 	err := errors.New("NETWORK IS DOWN")
 	if !isInterfaceGone(err) {
 		t.Errorf("expected true for uppercase 'NETWORK IS DOWN', got false")
+	}
+}
+
+func TestIsInterfaceGone_WriteDeadlineExceeded_ReturnsTrue(t *testing.T) {
+	// a multicast write that timed out never drains, the interface must back off
+	err := &net.OpError{Op: "write", Net: "udp", Err: os.ErrDeadlineExceeded}
+	if !isInterfaceGone(err) {
+		t.Errorf("expected true for write deadline exceeded, got false")
 	}
 }

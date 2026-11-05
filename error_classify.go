@@ -2,6 +2,7 @@ package zeroconf
 
 import (
 	"errors"
+	"os"
 	"strings"
 	"syscall"
 )
@@ -37,6 +38,11 @@ var interfaceGoneErrors = []syscall.Errno{
 func isInterfaceGone(err error) bool {
 	if err == nil {
 		return false
+	}
+
+	// a timed out write would stall the next send again, back off the interface like a gone one
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
 	}
 
 	// Check known error codes
