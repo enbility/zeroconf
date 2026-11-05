@@ -5,6 +5,7 @@ import (
 	"net"
 	"runtime"
 	"syscall"
+	"time"
 
 	"github.com/enbility/zeroconf/v3/api"
 	"golang.org/x/net/ipv6"
@@ -62,6 +63,12 @@ func (c *ipv6PacketConn) WriteTo(b []byte, ifIndex int, dst net.Addr) (n int, er
 				return 0, fmt.Errorf("set multicast interface %s: %w", iface.Name, err)
 			}
 		}
+	}
+
+	// a multicast write can block forever when the socket stops draining (seen on macOS with
+	// many interfaces), stalling every later announcement and Shutdown: drop the packet instead
+	if err := c.conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+		return 0, err
 	}
 
 	return c.conn.WriteTo(b, cm, dst)
